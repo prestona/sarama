@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 )
 
 type none struct{}
@@ -112,6 +113,8 @@ type KafkaVersion struct {
 	// it's a struct rather than just typing the array directly to make it opaque and stop people
 	// generating their own arbitrary versions
 	version [4]uint
+
+	automatic bool
 }
 
 func newKafkaVersion(major, minor, veryMinor, patch uint) KafkaVersion {
@@ -126,6 +129,10 @@ func newKafkaVersion(major, minor, veryMinor, patch uint) KafkaVersion {
 //	V1.IsAtLeast(V2) // false
 //	V2.IsAtLeast(V1) // true
 func (v KafkaVersion) IsAtLeast(other KafkaVersion) bool {
+	if v.automatic {
+		panic("can't compare automatic version")
+	}
+
 	for i := range v.version {
 		if v.version[i] > other.version[i] {
 			return true
@@ -199,6 +206,10 @@ var (
 	V3_5_0_0  = newKafkaVersion(3, 5, 0, 0)
 	V3_5_1_0  = newKafkaVersion(3, 5, 1, 0)
 	V3_6_0_0  = newKafkaVersion(3, 6, 0, 0)
+
+	Automatic = KafkaVersion{
+		automatic: true,
+	}
 
 	SupportedVersions = []KafkaVersion{
 		V0_8_2_0,
@@ -292,6 +303,10 @@ var (
 
 // ParseKafkaVersion parses and returns kafka version or error from a string
 func ParseKafkaVersion(s string) (KafkaVersion, error) {
+	if strings.EqualFold(strings.TrimSpace(s), "automatic") {
+		return Automatic, nil
+	}
+
 	if len(s) < 5 {
 		return DefaultVersion, fmt.Errorf("invalid version `%s`", s)
 	}
@@ -317,6 +332,9 @@ func scanKafkaVersion(s string, pattern *regexp.Regexp, format string, v [3]*uin
 }
 
 func (v KafkaVersion) String() string {
+	if v.automatic {
+		return "Automatic"
+	}
 	if v.version[0] == 0 {
 		return fmt.Sprintf("0.%d.%d.%d", v.version[1], v.version[2], v.version[3])
 	}

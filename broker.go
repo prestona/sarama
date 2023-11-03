@@ -1007,25 +1007,29 @@ func (b *Broker) sendWithPromise(rb requestProtocolBody, promise *responsePromis
 
 // b.lock must be held by caller
 func (b *Broker) sendInternal(rb requestProtocolBody, promise *responsePromise) error {
-	b.versionsMu.Lock()
-	versions := b.versions
-	b.versionsMu.Unlock()
+	if b.conf.Version == Automatic {
+		b.versionsMu.Lock()
+		versions := b.versions
+		b.versionsMu.Unlock()
 
-	if versions == nil && (rb.key() == 18 || rb.key() == 3) {
-		// TODO: need to prevent API key 3 (metadata request) getting ahead of the initial
-		// APIVersions request. For the moment, just assume it'll be fine...
-	} else {
-		brokerSupported := versions.ApiKeys[rb.key()]
-		version := brokerSupported.MaxVersion
-		_, protoMax := rb.supportedVersions()
-		if version > protoMax {
-			version = protoMax
+		if versions == nil && (rb.key() == 18 || rb.key() == 3) {
+			// TODO: need to prevent API key 3 (metadata request) getting ahead of the initial
+			// APIVersions request. For the moment, just assume it'll be fine...
+		} else { //if versions != nil || (rb.key() != 18) {
+			brokerSupported := versions.ApiKeys[rb.key()]
+			version := brokerSupported.MaxVersion
+			_, protoMax := rb.supportedVersions()
+			if version > protoMax {
+				version = protoMax
+			}
+			// TODO: handle minVersion checking
+			// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
+			// 	return ErrUnsupportedVersion
+			// }
+			rb.setVersion(version)
 		}
-		// TODO: handle minVersion checking
-		// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
-		// 	return ErrUnsupportedVersion
-		// }
-		rb.setVersion(version)
+	} else if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
+		return ErrUnsupportedVersion
 	}
 
 	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
