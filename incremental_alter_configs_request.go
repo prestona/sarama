@@ -176,3 +176,11 @@ func (a *IncrementalAlterConfigsRequest) isValidVersion() bool {
 func (a *IncrementalAlterConfigsRequest) requiredVersion() KafkaVersion {
 	return V2_3_0_0
 }
+
+func (a *IncrementalAlterConfigsRequest) supportedVersions() (int16, int16) {
+	return 0, 0
+}
+
+func (a *IncrementalAlterConfigsRequest) setVersion(v int16) {
+	a.Version = v
+}

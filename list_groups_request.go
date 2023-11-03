@@ -80,3 +80,11 @@ func (r *ListGroupsRequest) requiredVersion() KafkaVersion {
 		return V2_6_0_0
 	}
 }
+
+func (r *ListGroupsRequest) supportedVersions() (int16, int16) {
+	return 0, 4
+}
+
+func (r *ListGroupsRequest) setVersion(v int16) {
+	r.Version = v
+}

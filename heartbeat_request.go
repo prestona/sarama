@@ -78,3 +78,11 @@ func (r *HeartbeatRequest) requiredVersion() KafkaVersion {
 		return V2_3_0_0
 	}
 }
+
+func (r *HeartbeatRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (r *HeartbeatRequest) setVersion(v int16) {
+	r.Version = v
+}

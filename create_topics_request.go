@@ -106,6 +106,14 @@ func (c *CreateTopicsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *CreateTopicsRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (r *CreateTopicsRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 type TopicDetail struct {
 	// NumPartitions contains the number of partitions to create in the topic, or
 	// -1 if we are either specifying a manual partition assignment or using the

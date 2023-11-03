@@ -224,6 +224,14 @@ func (r *OffsetCommitRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *OffsetCommitRequest) supportedVersions() (int16, int16) {
+	return 0, 7
+}
+
+func (r *OffsetCommitRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *OffsetCommitRequest) AddBlock(topic string, partitionID int32, offset int64, timestamp int64, metadata string) {
 	r.AddBlockWithLeaderEpoch(topic, partitionID, offset, 0, timestamp, metadata)
 }

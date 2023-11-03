@@ -32,6 +32,8 @@ type Broker struct {
 	opened        int32
 	responses     chan *responsePromise
 	done          chan bool
+	versionsMu    sync.Mutex // TODO: would atomic.Pointer be better?
+	versions      *ApiVersionsResponse
 
 	metricRegistry             metrics.Registry
 	incomingByteRate           metrics.Meter
@@ -173,7 +175,8 @@ func (b *Broker) Open(conf *Config) error {
 		return err
 	}
 
-	usingApiVersionsRequests := conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
+	// TODO: just force this to on for now.
+	usingApiVersionsRequests := true //conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
 
 	b.lock.Lock()
 
@@ -189,14 +192,19 @@ func (b *Broker) Open(conf *Config) error {
 			// Ideally Sarama would use the response to control protocol versions,
 			// but for now just fire-and-forget just to send
 			if usingApiVersionsRequests {
-				_, err = b.ApiVersions(&ApiVersionsRequest{
-					Version:               3,
+				// TODO: need to negotiate version of ApiVersions as per KIP-511
+				versions, err := b.ApiVersions(&ApiVersionsRequest{
+					Version:               0, // TODO: need to properly support back-level brokers
 					ClientSoftwareName:    defaultClientSoftwareName,
 					ClientSoftwareVersion: version(),
 				})
 				if err != nil {
+					// TODO: need a better way to handle ApiVersions failing.
 					Logger.Printf("Error while sending ApiVersionsRequest to broker %s: %s\n", b.addr, err)
 				}
+				b.versionsMu.Lock()
+				b.versions = versions
+				b.versionsMu.Unlock()
 			}
 		}()
 		dialer := conf.getDialer()
@@ -334,6 +342,9 @@ func (b *Broker) Close() error {
 	b.connErr = nil
 	b.done = nil
 	b.responses = nil
+	b.versionsMu.Lock()
+	b.versions = nil
+	b.versionsMu.Unlock()
 
 	b.metricRegistry.UnregisterAll()
 
@@ -951,7 +962,7 @@ func (b *Broker) write(buf []byte) (n int, err error) {
 }
 
 // b.lock must be held by caller
-func (b *Broker) send(rb protocolBody, promiseResponse bool, responseHeaderVersion int16) (*responsePromise, error) {
+func (b *Broker) send(rb requestProtocolBody, promiseResponse bool, responseHeaderVersion int16) (*responsePromise, error) {
 	var promise *responsePromise
 	if promiseResponse {
 		// Packets or error will be sent to the following channels
@@ -976,7 +987,7 @@ func makeResponsePromise(responseHeaderVersion int16) *responsePromise {
 }
 
 // b.lock must be held by caller
-func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) error {
+func (b *Broker) sendWithPromise(rb requestProtocolBody, promise *responsePromise) error {
 	if b.conn == nil {
 		if b.connErr != nil {
 			return b.connErr
@@ -995,9 +1006,26 @@ func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) erro
 }
 
 // b.lock must be held by caller
-func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
-	if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
-		return ErrUnsupportedVersion
+func (b *Broker) sendInternal(rb requestProtocolBody, promise *responsePromise) error {
+	b.versionsMu.Lock()
+	versions := b.versions
+	b.versionsMu.Unlock()
+
+	if versions == nil && (rb.key() == 18 || rb.key() == 3) {
+		// TODO: need to prevent API key 3 (metadata request) getting ahead of the initial
+		// APIVersions request. For the moment, just assume it'll be fine...
+	} else {
+		brokerSupported := versions.ApiKeys[rb.key()]
+		version := brokerSupported.MaxVersion
+		_, protoMax := rb.supportedVersions()
+		if version > protoMax {
+			version = protoMax
+		}
+		// TODO: handle minVersion checking
+		// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
+		// 	return ErrUnsupportedVersion
+		// }
+		rb.setVersion(version)
 	}
 
 	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
@@ -1034,7 +1062,7 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 	return nil
 }
 
-func (b *Broker) sendAndReceive(req protocolBody, res protocolBody) error {
+func (b *Broker) sendAndReceive(req requestProtocolBody, res protocolBody) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	responseHeaderVersion := int16(-1)

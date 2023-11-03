@@ -132,3 +132,11 @@ func (r *AlterPartitionReassignmentsRequest) AddBlock(topic string, partitionID 
 
 	r.blocks[topic][partitionID] = &alterPartitionReassignmentsBlock{replicas}
 }
+
+func (a *AlterPartitionReassignmentsRequest) supportedVersions() (int16, int16) {
+	return 0, 0
+}
+
+func (a *AlterPartitionReassignmentsRequest) setVersion(v int16) {
+	a.Version = v
+}

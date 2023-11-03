@@ -136,3 +136,11 @@ func (a *AlterConfigsRequest) requiredVersion() KafkaVersion {
 		return V2_0_0_0
 	}
 }
+
+func (a *AlterConfigsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (a *AlterConfigsRequest) setVersion(v int16) {
+	a.Version = v
+}

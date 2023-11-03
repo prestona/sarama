@@ -75,3 +75,11 @@ func (r *ApiVersionsRequest) requiredVersion() KafkaVersion {
 		return V2_4_0_0
 	}
 }
+
+func (r *ApiVersionsRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (r *ApiVersionsRequest) setVersion(v int16) {
+	r.Version = v
+}

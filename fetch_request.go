@@ -311,6 +311,14 @@ func (r *FetchRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *FetchRequest) supportedVersions() (int16, int16) {
+	return 0, 11
+}
+
+func (r *FetchRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *FetchRequest) AddBlock(topic string, partitionID int32, fetchOffset int64, maxBytes int32, leaderEpoch int32) {
 	if r.blocks == nil {
 		r.blocks = make(map[string]map[int32]*fetchRequestBlock)

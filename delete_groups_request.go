@@ -41,6 +41,14 @@ func (r *DeleteGroupsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *DeleteGroupsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (r *DeleteGroupsRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *DeleteGroupsRequest) AddGroup(group string) {
 	r.Groups = append(r.Groups, group)
 }

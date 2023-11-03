@@ -64,3 +64,11 @@ func (a *EndTxnRequest) requiredVersion() KafkaVersion {
 		return V0_11_0_0
 	}
 }
+
+func (a *EndTxnRequest) supportedVersions() (int16, int16) {
+	return 0, 2
+}
+
+func (a *EndTxnRequest) setVersion(v int16) {
+	a.Version = v
+}

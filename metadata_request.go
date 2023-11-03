@@ -238,3 +238,11 @@ func (r *MetadataRequest) requiredVersion() KafkaVersion {
 		return V2_8_0_0
 	}
 }
+
+func (r *MetadataRequest) supportedVersions() (int16, int16) {
+	return 0, 10
+}
+
+func (r *MetadataRequest) setVersion(v int16) {
+	r.Version = v
+}

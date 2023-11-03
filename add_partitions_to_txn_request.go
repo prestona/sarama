@@ -91,3 +91,11 @@ func (a *AddPartitionsToTxnRequest) requiredVersion() KafkaVersion {
 		return V0_11_0_0
 	}
 }
+
+func (a *AddPartitionsToTxnRequest) supportedVersions() (int16, int16) {
+	return 0, 2
+}
+
+func (a *AddPartitionsToTxnRequest) setVersion(v int16) {
+	a.Version = v
+}

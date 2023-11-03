@@ -45,3 +45,11 @@ func (r *SaslHandshakeRequest) requiredVersion() KafkaVersion {
 		return V0_10_0_0
 	}
 }
+
+func (r *SaslHandshakeRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (r *SaslHandshakeRequest) setVersion(v int16) {
+	r.Version = v
+}

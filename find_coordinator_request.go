@@ -69,3 +69,11 @@ func (f *FindCoordinatorRequest) requiredVersion() KafkaVersion {
 		return V0_8_2_0
 	}
 }
+
+func (f *FindCoordinatorRequest) supportedVersions() (int16, int16) {
+	return 0, 2
+}
+
+func (f *FindCoordinatorRequest) setVersion(v int16) {
+	f.Version = v
+}

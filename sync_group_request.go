@@ -142,6 +142,14 @@ func (r *SyncGroupRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *SyncGroupRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (r *SyncGroupRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *SyncGroupRequest) AddGroupAssignment(memberId string, memberAssignment []byte) {
 	r.GroupAssignments = append(r.GroupAssignments, SyncGroupRequestAssignment{
 		MemberId:   memberId,

@@ -64,3 +64,11 @@ func (d *DeleteAclsRequest) requiredVersion() KafkaVersion {
 		return V0_11_0_0
 	}
 }
+
+func (d *DeleteAclsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (d *DeleteAclsRequest) setVersion(v int16) {
+	d.Version = int(v)
+}

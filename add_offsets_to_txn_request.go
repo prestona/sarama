@@ -69,3 +69,11 @@ func (a *AddOffsetsToTxnRequest) requiredVersion() KafkaVersion {
 		return V2_7_0_0
 	}
 }
+
+func (a *AddOffsetsToTxnRequest) supportedVersions() (int16, int16) {
+	return 0, 2
+}
+
+func (a *AddOffsetsToTxnRequest) setVersion(v int16) {
+	a.Version = v
+}

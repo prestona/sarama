@@ -60,3 +60,11 @@ func (d *DeleteTopicsRequest) requiredVersion() KafkaVersion {
 		return V2_2_0_0
 	}
 }
+
+func (d *DeleteTopicsRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (d *DeleteTopicsRequest) setVersion(v int16) {
+	d.Version = v
+}

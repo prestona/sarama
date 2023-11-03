@@ -191,6 +191,14 @@ func (r *JoinGroupRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *JoinGroupRequest) supportedVersions() (int16, int16) {
+	return 0, 5
+}
+
+func (r *JoinGroupRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *JoinGroupRequest) AddGroupProtocol(name string, metadata []byte) {
 	r.OrderedGroupProtocols = append(r.OrderedGroupProtocols, &GroupProtocol{
 		Name:     name,

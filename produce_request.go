@@ -237,6 +237,14 @@ func (r *ProduceRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *ProduceRequest) supportedVersions() (int16, int16) {
+	return 0, 7
+}
+
+func (r *ProduceRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *ProduceRequest) ensureRecords(topic string, partition int32) {
 	if r.records == nil {
 		r.records = make(map[string]map[int32]Records)

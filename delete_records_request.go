@@ -95,6 +95,14 @@ func (d *DeleteRecordsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (d *DeleteRecordsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (d *DeleteRecordsRequest) setVersion(v int16) {
+	d.Version = v
+}
+
 type DeleteRecordsRequestTopic struct {
 	PartitionOffsets map[int32]int64 // partition => offset
 }

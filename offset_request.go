@@ -176,6 +176,14 @@ func (r *OffsetRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *OffsetRequest) supportedVersions() (int16, int16) {
+	return 0, 4
+}
+
+func (r *OffsetRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *OffsetRequest) SetReplicaID(id int32) {
 	r.replicaID = id
 	r.isReplicaIDSet = true

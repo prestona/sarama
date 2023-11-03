@@ -197,3 +197,11 @@ func (a *AlterClientQuotasRequest) isValidVersion() bool {
 func (a *AlterClientQuotasRequest) requiredVersion() KafkaVersion {
 	return V2_6_0_0
 }
+
+func (a *AlterClientQuotasRequest) supportedVersions() (int16, int16) {
+	return 0, 0
+}
+
+func (a *AlterClientQuotasRequest) setVersion(v int16) {
+	a.Version = v
+}

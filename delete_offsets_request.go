@@ -88,6 +88,14 @@ func (r *DeleteOffsetsRequest) requiredVersion() KafkaVersion {
 	return V2_4_0_0
 }
 
+func (r *DeleteOffsetsRequest) supportedVersions() (int16, int16) {
+	return 0, 0
+}
+
+func (r *DeleteOffsetsRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *DeleteOffsetsRequest) AddPartition(topic string, partitionID int32) {
 	if r.partitions == nil {
 		r.partitions = make(map[string][]int32)

@@ -114,6 +114,14 @@ func (a *TxnOffsetCommitRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (a *TxnOffsetCommitRequest) supportedVersions() (int16, int16) {
+	return 0, 2
+}
+
+func (a *TxnOffsetCommitRequest) setVersion(v int16) {
+	a.Version = v
+}
+
 type PartitionOffsetMetadata struct {
 	// Partition contains the index of the partition within the topic.
 	Partition int32

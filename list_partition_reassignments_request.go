@@ -100,3 +100,11 @@ func (r *ListPartitionReassignmentsRequest) AddBlock(topic string, partitionIDs 
 		r.blocks[topic] = partitionIDs
 	}
 }
+
+func (r *ListPartitionReassignmentsRequest) supportedVersions() (int16, int16) {
+	return 0, 0
+}
+
+func (r *ListPartitionReassignmentsRequest) setVersion(v int16) {
+	r.Version = v
+}

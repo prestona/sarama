@@ -87,6 +87,14 @@ func (r *CreatePartitionsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *CreatePartitionsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (r *CreatePartitionsRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 type TopicPartition struct {
 	Count      int32
 	Assignment [][]int32

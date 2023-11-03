@@ -16,6 +16,12 @@ type protocolBody interface {
 	requiredVersion() KafkaVersion
 }
 
+type requestProtocolBody interface {
+	protocolBody
+	setVersion(int16)
+	supportedVersions() (int16, int16)
+}
+
 type request struct {
 	correlationID int32
 	clientID      string

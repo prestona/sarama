@@ -104,3 +104,11 @@ func (i *InitProducerIDRequest) requiredVersion() KafkaVersion {
 		return V2_7_0_0
 	}
 }
+
+func (i *InitProducerIDRequest) supportedVersions() (int16, int16) {
+	return 0, 4
+}
+
+func (i *InitProducerIDRequest) setVersion(v int16) {
+	i.Version = v
+}

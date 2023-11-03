@@ -64,6 +64,14 @@ func (c *CreateAclsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (c *CreateAclsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (c *CreateAclsRequest) setVersion(v int16) {
+	c.Version = v
+}
+
 // AclCreation is a wrapper around Resource and Acl type
 type AclCreation struct {
 	Resource

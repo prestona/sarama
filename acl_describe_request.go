@@ -41,3 +41,11 @@ func (d *DescribeAclsRequest) requiredVersion() KafkaVersion {
 		return V0_11_0_0
 	}
 }
+
+func (d *DescribeAclsRequest) supportedVersions() (int16, int16) {
+	return 0, 1
+}
+
+func (d *DescribeAclsRequest) setVersion(v int16) {
+	d.Version = int(v)
+}

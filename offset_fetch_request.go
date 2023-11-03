@@ -198,6 +198,14 @@ func (r *OffsetFetchRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *OffsetFetchRequest) supportedVersions() (int16, int16) {
+	return 0, 7
+}
+
+func (r *OffsetFetchRequest) setVersion(v int16) {
+	r.Version = v
+}
+
 func (r *OffsetFetchRequest) ZeroPartitions() {
 	if r.partitions == nil && r.Version >= 2 {
 		r.partitions = make(map[string][]int32)

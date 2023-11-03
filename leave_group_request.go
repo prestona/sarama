@@ -99,3 +99,11 @@ func (r *LeaveGroupRequest) requiredVersion() KafkaVersion {
 		return V2_4_0_0
 	}
 }
+
+func (r *LeaveGroupRequest) supportedVersions() (int16, int16) {
+	return 0, 3
+}
+
+func (r *LeaveGroupRequest) setVersion(v int16) {
+	r.Version = v
+}

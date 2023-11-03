@@ -66,3 +66,11 @@ func (r *DescribeGroupsRequest) requiredVersion() KafkaVersion {
 func (r *DescribeGroupsRequest) AddGroup(group string) {
 	r.Groups = append(r.Groups, group)
 }
+
+func (r *DescribeGroupsRequest) supportedVersions() (int16, int16) {
+	return 0, 4
+}
+
+func (r *DescribeGroupsRequest) setVersion(v int16) {
+	r.Version = v
+}
