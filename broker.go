@@ -32,7 +32,6 @@ type Broker struct {
 	opened        int32
 	responses     chan *responsePromise
 	done          chan bool
-	versionsMu    sync.Mutex // TODO: would atomic.Pointer be better?
 	versions      *ApiVersionsResponse
 
 	metricRegistry             metrics.Registry
@@ -175,9 +174,6 @@ func (b *Broker) Open(conf *Config) error {
 		return err
 	}
 
-	// TODO: just force this to on for now.
-	usingApiVersionsRequests := true //conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
-
 	b.lock.Lock()
 
 	if b.metricRegistry == nil {
@@ -186,6 +182,9 @@ func (b *Broker) Open(conf *Config) error {
 
 	go withRecover(func() {
 		defer func() {
+			// TODO: just force this to on for now.
+			usingApiVersionsRequests := true //conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
+
 			b.lock.Unlock()
 
 			// Send an ApiVersionsRequest to identify the client (KIP-511).
@@ -193,18 +192,14 @@ func (b *Broker) Open(conf *Config) error {
 			// but for now just fire-and-forget just to send
 			if usingApiVersionsRequests {
 				// TODO: need to negotiate version of ApiVersions as per KIP-511
-				versions, err := b.ApiVersions(&ApiVersionsRequest{
-					Version:               0, // TODO: need to properly support back-level brokers
+				_, err := b.ApiVersions(&ApiVersionsRequest{
+					Version:               3, // TODO: need to properly support back-level brokers
 					ClientSoftwareName:    defaultClientSoftwareName,
 					ClientSoftwareVersion: version(),
 				})
 				if err != nil {
-					// TODO: need a better way to handle ApiVersions failing.
 					Logger.Printf("Error while sending ApiVersionsRequest to broker %s: %s\n", b.addr, err)
 				}
-				b.versionsMu.Lock()
-				b.versions = versions
-				b.versionsMu.Unlock()
 			}
 		}()
 		dialer := conf.getDialer()
@@ -239,11 +234,31 @@ func (b *Broker) Open(conf *Config) error {
 			b.registerMetrics()
 		}
 
-		if conf.Net.SASL.Mechanism == SASLTypeOAuth && conf.Net.SASL.Version == SASLHandshakeV0 {
-			conf.Net.SASL.Version = SASLHandshakeV1
+		var useSaslV0 bool
+		if conf.Version == Automatic {
+			b.versions, b.connErr = b.sendAndReceiveV0ApiVersions()
+			if b.connErr != nil {
+				// TODO: this is duplicate code (from the SASLV0 case)
+				err = b.conn.Close()
+				if err == nil {
+					DebugLogger.Printf("Closed connection to broker %s\n", b.addr)
+				} else {
+					Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
+				}
+				b.conn = nil
+				atomic.StoreInt32(&b.opened, 0)
+				return
+			}
+
+			// TODO: work out SASLv0 from versions
+		} else {
+			// TODO: work out SASLv0 from voodoo
+			if conf.Net.SASL.Mechanism == SASLTypeOAuth && conf.Net.SASL.Version == SASLHandshakeV0 {
+				conf.Net.SASL.Version = SASLHandshakeV1
+			}
+			useSaslV0 = conf.Net.SASL.Version == SASLHandshakeV0 || conf.Net.SASL.Mechanism == SASLTypeGSSAPI
 		}
 
-		useSaslV0 := conf.Net.SASL.Version == SASLHandshakeV0 || conf.Net.SASL.Mechanism == SASLTypeGSSAPI
 		if conf.Net.SASL.Enable && useSaslV0 {
 			b.connErr = b.authenticateViaSASLv0()
 
@@ -342,9 +357,7 @@ func (b *Broker) Close() error {
 	b.connErr = nil
 	b.done = nil
 	b.responses = nil
-	b.versionsMu.Lock()
 	b.versions = nil
-	b.versionsMu.Unlock()
 
 	b.metricRegistry.UnregisterAll()
 
@@ -1008,26 +1021,17 @@ func (b *Broker) sendWithPromise(rb requestProtocolBody, promise *responsePromis
 // b.lock must be held by caller
 func (b *Broker) sendInternal(rb requestProtocolBody, promise *responsePromise) error {
 	if b.conf.Version == Automatic {
-		b.versionsMu.Lock()
-		versions := b.versions
-		b.versionsMu.Unlock()
-
-		if versions == nil && (rb.key() == 18 || rb.key() == 3) {
-			// TODO: need to prevent API key 3 (metadata request) getting ahead of the initial
-			// APIVersions request. For the moment, just assume it'll be fine...
-		} else { //if versions != nil || (rb.key() != 18) {
-			brokerSupported := versions.ApiKeys[rb.key()]
-			version := brokerSupported.MaxVersion
-			_, protoMax := rb.supportedVersions()
-			if version > protoMax {
-				version = protoMax
-			}
-			// TODO: handle minVersion checking
-			// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
-			// 	return ErrUnsupportedVersion
-			// }
-			rb.setVersion(version)
+		brokerSupported := b.versions.ApiKeys[rb.key()]
+		version := brokerSupported.MaxVersion
+		_, protoMax := rb.supportedVersions()
+		if version > protoMax {
+			version = protoMax
 		}
+		// TODO: handle minVersion checking
+		// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
+		// 	return ErrUnsupportedVersion
+		// }
+		rb.setVersion(version)
 	} else if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
 		return ErrUnsupportedVersion
 	}
@@ -1333,47 +1337,39 @@ func (b *Broker) sendAndReceiveKerberos() error {
 	return b.kerberosAuthenticator.Authorize(b)
 }
 
+func (b *Broker) sendAndReceiveV0ApiVersions() (*ApiVersionsResponse, error) {
+	rb := &ApiVersionsRequest{Version: 0}
+
+	payload, err := b.exchange(rb)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &ApiVersionsResponse{Version: 0}
+	err = versionedDecode(payload, res, 0, b.metricRegistry)
+	if err != nil {
+		Logger.Printf("Failed to parse APIVersions response : %s\n", err.Error())
+		return nil, err
+	}
+
+	kerr := KError(res.ErrorCode)
+	if !errors.Is(kerr, ErrNoError) {
+		// TODO: can we do something more helpful here?
+		Logger.Printf("Error returned from APIVersions request : %s\n", kerr.Error())
+		return nil, kerr
+	}
+
+	return res, nil
+}
+
 func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int16) error {
 	rb := &SaslHandshakeRequest{Mechanism: string(saslType), Version: version}
-
-	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
-	buf, err := encode(req, b.metricRegistry)
+	payload, err := b.exchange(rb)
 	if err != nil {
 		return err
 	}
 
-	requestTime := time.Now()
-	// Will be decremented in updateIncomingCommunicationMetrics (except error)
-	b.addRequestInFlightMetrics(1)
-	bytes, err := b.write(buf)
-	b.updateOutgoingCommunicationMetrics(bytes)
-	if err != nil {
-		b.addRequestInFlightMetrics(-1)
-		Logger.Printf("Failed to send SASL handshake %s: %s\n", b.addr, err.Error())
-		return err
-	}
-	b.correlationID++
-
-	header := make([]byte, 8) // response header
-	_, err = b.readFull(header)
-	if err != nil {
-		b.addRequestInFlightMetrics(-1)
-		Logger.Printf("Failed to read SASL handshake header : %s\n", err.Error())
-		return err
-	}
-
-	length := binary.BigEndian.Uint32(header[:4])
-	payload := make([]byte, length-4)
-	n, err := b.readFull(payload)
-	if err != nil {
-		b.addRequestInFlightMetrics(-1)
-		Logger.Printf("Failed to read SASL handshake payload : %s\n", err.Error())
-		return err
-	}
-
-	b.updateIncomingCommunicationMetrics(n+8, time.Since(requestTime))
 	res := &SaslHandshakeResponse{}
-
 	err = versionedDecode(payload, res, 0, b.metricRegistry)
 	if err != nil {
 		Logger.Printf("Failed to parse SASL handshake : %s\n", err.Error())
@@ -1387,6 +1383,48 @@ func (b *Broker) sendAndReceiveSASLHandshake(saslType SASLMechanism, version int
 
 	DebugLogger.Print("Completed pre-auth SASL handshake. Available mechanisms: ", res.EnabledMechanisms)
 	return nil
+}
+
+// TODO: document the difference between this and sendAndReceive
+// TODO: only useful for single "threaded" access to the broker. So during setup.
+func (b *Broker) exchange(rb protocolBody) ([]byte, error) {
+	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
+	buf, err := encode(req, b.metricRegistry)
+	if err != nil {
+		return nil, err
+	}
+
+	requestTime := time.Now()
+	// Will be decremented in updateIncomingCommunicationMetrics (except error)
+	b.addRequestInFlightMetrics(1)
+	bytes, err := b.write(buf)
+	b.updateOutgoingCommunicationMetrics(bytes)
+	if err != nil {
+		b.addRequestInFlightMetrics(-1)
+		Logger.Printf("Failed to send SASL handshake %s: %s\n", b.addr, err.Error())
+		return nil, err
+	}
+	b.correlationID++
+
+	header := make([]byte, 8) // response header
+	_, err = b.readFull(header)
+	if err != nil {
+		b.addRequestInFlightMetrics(-1)
+		Logger.Printf("Failed to read SASL handshake header : %s\n", err.Error())
+		return nil, err
+	}
+
+	length := binary.BigEndian.Uint32(header[:4])
+	payload := make([]byte, length-4)
+	n, err := b.readFull(payload)
+	if err != nil {
+		b.addRequestInFlightMetrics(-1)
+		Logger.Printf("Failed to read SASL handshake payload : %s\n", err.Error())
+		return nil, err
+	}
+
+	b.updateIncomingCommunicationMetrics(n+8, time.Since(requestTime))
+	return payload, nil
 }
 
 //
