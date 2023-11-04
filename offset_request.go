@@ -176,6 +176,27 @@ func (r *OffsetRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *OffsetRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_1_0_0):
+		// Version 4 adds the current leader epoch, which is used for fencing.
+		r.Version = 4
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 3 is the same as version 2.
+		r.Version = 3
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 2 adds the isolation level, which is used for transactional reads.
+		r.Version = 2
+	case v.IsAtLeast(V0_10_1_0):
+		// Version 1 removes MaxNumOffsets.  From this version forward, only a single
+		// offset can be returned.
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *OffsetRequest) supportedVersions() (int16, int16) {
 	return 0, 4
 }

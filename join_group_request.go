@@ -191,6 +191,27 @@ func (r *JoinGroupRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *JoinGroupRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_3_0_0):
+		r.Version = 5
+	case v.IsAtLeast(V2_2_0_0):
+		// from JoinGroupRequest v4 onwards (due to KIP-394) the client will actually
+		// send two JoinGroupRequests, once with the empty member id, and then again
+		// with the assigned id from the first response. This is handled via the
+		// ErrMemberIdRequired case.
+		r.Version = 4
+	case v.IsAtLeast(V2_0_0_0):
+		r.Version = 3
+	case v.IsAtLeast(V0_11_0_0):
+		r.Version = 2
+	case v.IsAtLeast(V0_10_1_0):
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
 func (r *JoinGroupRequest) supportedVersions() (int16, int16) {
 	return 0, 5
 }

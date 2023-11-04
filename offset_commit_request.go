@@ -232,6 +232,33 @@ func (r *OffsetCommitRequest) setVersion(v int16) {
 	r.Version = v
 }
 
+func (r *OffsetCommitRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_3_0_0):
+		// version 7 adds a new field called groupInstanceId to indicate member identity across restarts.
+		r.Version = 7
+	case v.IsAtLeast(V2_1_0_0):
+		// Version 5 removes the retention time, which is now controlled only by a broker configuration.
+		// Version 6 adds the leader epoch for fencing
+		r.Version = 6
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 4 is the same as version 2.
+		r.Version = 4
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 3 is the same as version 2.
+		r.Version = 3
+	case v.IsAtLeast(V0_9_0_0):
+		// Version 2 adds retention time.  It removes the commit timestamp added in version 1.
+		r.Version = 2
+	case v.IsAtLeast(V0_8_2_0):
+		// Version 1 adds timestamp and group membership information, as well as the commit timestamp.
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *OffsetCommitRequest) AddBlock(topic string, partitionID int32, offset int64, timestamp int64, metadata string) {
 	r.AddBlockWithLeaderEpoch(topic, partitionID, offset, 0, timestamp, metadata)
 }

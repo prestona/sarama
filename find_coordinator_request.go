@@ -70,6 +70,21 @@ func (f *FindCoordinatorRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (f *FindCoordinatorRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+		// do nothing
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 2 is the same as version 1.
+		f.Version = 2
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 1 adds KeyType.
+		f.Version = 1
+	default:
+		f.Version = 0
+	}
+}
+
 func (f *FindCoordinatorRequest) supportedVersions() (int16, int16) {
 	return 0, 2
 }

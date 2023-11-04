@@ -79,6 +79,23 @@ func (r *HeartbeatRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *HeartbeatRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_3_0_0):
+		// Starting from version 3, we add a new field called groupInstanceId to indicate member identity across restarts.
+		r.Version = 3
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 2 is the same s version 1
+		r.Version = 2
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 1 is the same as version 0
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *HeartbeatRequest) supportedVersions() (int16, int16) {
 	return 0, 3
 }

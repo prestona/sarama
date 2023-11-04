@@ -319,6 +319,52 @@ func (r *FetchRequest) setVersion(v int16) {
 	r.Version = v
 }
 
+func (r *FetchRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_3_0_0):
+		// Version 11 adds RackID for KIP-392 fetch from closest replica
+		r.Version = 11
+	case v.IsAtLeast(V2_1_0_0):
+		// Version 9 adds CurrentLeaderEpoch, as described in KIP-320.
+		// Version 10 indicates that we can use the ZStd compression algorithm, as
+		// described in KIP-110.
+		r.Version = 10
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 8 is the same as version 7.
+		r.Version = 8
+	case v.IsAtLeast(V1_1_0_0):
+		// Version 7 adds incremental fetch request support.
+		// We do not currently implement KIP-227 FetchSessions. Setting the id to 0
+		// and the epoch to -1 tells the broker not to generate as session ID we're going
+		// to just ignore anyway.
+		r.Version = 7
+	case v.IsAtLeast(V1_0_0_0):
+		// Version 6 is the same as version 5.
+		r.Version = 6
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 4 adds IsolationLevel.  Starting in version 4, the requestor must be
+		// able to handle Kafka log message format version 2.
+		// Version 5 adds LogStartOffset to indicate the earliest available offset of
+		// partition data that can be consumed.
+		r.Version = 5
+	case v.IsAtLeast(V0_10_1_0):
+		// Version 3 adds MaxBytes.  Starting in version 3, the partition ordering in
+		// the request is now relevant.  Partitions will be processed in the order
+		// they appear in the request.
+		r.Version = 3
+	case v.IsAtLeast(V0_10_0_0):
+		r.Version = 2
+		// Starting in Version 2, the requestor must be able to handle Kafka Log
+		// Message format version 1.
+	case v.IsAtLeast(V0_9_0_0):
+		// Version 1 is the same as version 0.
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *FetchRequest) AddBlock(topic string, partitionID int32, fetchOffset int64, maxBytes int32, leaderEpoch int32) {
 	if r.blocks == nil {
 		r.blocks = make(map[string]map[int32]*fetchRequestBlock)

@@ -23,25 +23,7 @@ type MetadataRequest struct {
 
 func NewMetadataRequest(version KafkaVersion, topics []string) *MetadataRequest {
 	m := &MetadataRequest{Topics: topics}
-	if version.IsAtLeast(V2_8_0_0) {
-		m.Version = 10
-	} else if version.IsAtLeast(V2_4_0_0) {
-		m.Version = 9
-	} else if version.IsAtLeast(V2_4_0_0) {
-		m.Version = 8
-	} else if version.IsAtLeast(V2_1_0_0) {
-		m.Version = 7
-	} else if version.IsAtLeast(V2_0_0_0) {
-		m.Version = 6
-	} else if version.IsAtLeast(V1_0_0_0) {
-		m.Version = 5
-	} else if version.IsAtLeast(V0_11_0_0) {
-		m.Version = 4
-	} else if version.IsAtLeast(V0_10_1_0) {
-		m.Version = 2
-	} else if version.IsAtLeast(V0_10_0_0) {
-		m.Version = 1
-	}
+	m.SetVersion(version)
 	return m
 }
 
@@ -236,6 +218,32 @@ func (r *MetadataRequest) requiredVersion() KafkaVersion {
 		return V0_8_2_0
 	default:
 		return V2_8_0_0
+	}
+}
+
+func (r *MetadataRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_8_0_0):
+		r.Version = 10
+	case v.IsAtLeast(V2_4_0_0):
+		r.Version = 9
+	case v.IsAtLeast(V2_4_0_0):
+		r.Version = 8
+	case v.IsAtLeast(V2_1_0_0):
+		r.Version = 7
+	case v.IsAtLeast(V2_0_0_0):
+		r.Version = 6
+	case v.IsAtLeast(V1_0_0_0):
+		r.Version = 5
+	case v.IsAtLeast(V0_11_0_0):
+		r.Version = 4
+	case v.IsAtLeast(V0_10_1_0):
+		r.Version = 2
+	case v.IsAtLeast(V0_10_0_0):
+		r.Version = 1
+	default:
+		r.Version = 0
 	}
 }
 

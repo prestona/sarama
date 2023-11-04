@@ -125,7 +125,11 @@ func NewConsumerGroupFromClient(groupID string, client Client) (ConsumerGroup, e
 
 func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 	config := client.Config()
-	if !config.Version.IsAtLeast(V0_10_2_0) {
+	// Can't perform this check if config.Version == Automatic, as Sarama doesn't know which
+	// broker requests will be sent to (and hence which to check the ApiVersionsRequest from).
+	// However, since setting config.Version = Automatic requires a broker that is >= 10.0.0
+	// (as that is when the ApiVersions API was added), there isn't a large window.
+	if config.Version != Automatic && !config.Version.IsAtLeast(V0_10_2_0) {
 		return nil, ConfigurationError("consumer groups require Version to be >= V0_10_2_0")
 	}
 
@@ -441,35 +445,14 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (*JoinGroupResponse, error) {
 	req := &JoinGroupRequest{
-		GroupId:        c.groupID,
-		MemberId:       c.memberID,
-		SessionTimeout: int32(c.config.Consumer.Group.Session.Timeout / time.Millisecond),
-		ProtocolType:   "consumer",
+		GroupId:          c.groupID,
+		MemberId:         c.memberID,
+		SessionTimeout:   int32(c.config.Consumer.Group.Session.Timeout / time.Millisecond),
+		ProtocolType:     "consumer",
+		RebalanceTimeout: int32(c.config.Consumer.Group.Rebalance.Timeout / time.Millisecond),
+		GroupInstanceId:  c.groupInstanceId,
 	}
-	if c.config.Version.IsAtLeast(V0_10_1_0) {
-		req.Version = 1
-		req.RebalanceTimeout = int32(c.config.Consumer.Group.Rebalance.Timeout / time.Millisecond)
-	}
-	if c.config.Version.IsAtLeast(V0_11_0_0) {
-		req.Version = 2
-	}
-	if c.config.Version.IsAtLeast(V0_11_0_0) {
-		req.Version = 2
-	}
-	if c.config.Version.IsAtLeast(V2_0_0_0) {
-		req.Version = 3
-	}
-	// from JoinGroupRequest v4 onwards (due to KIP-394) the client will actually
-	// send two JoinGroupRequests, once with the empty member id, and then again
-	// with the assigned id from the first response. This is handled via the
-	// ErrMemberIdRequired case.
-	if c.config.Version.IsAtLeast(V2_2_0_0) {
-		req.Version = 4
-	}
-	if c.config.Version.IsAtLeast(V2_3_0_0) {
-		req.Version = 5
-		req.GroupInstanceId = c.groupInstanceId
-	}
+	req.SetVersion(c.config.Version)
 
 	meta := &ConsumerGroupMemberMetadata{
 		Topics:   topics,
@@ -510,23 +493,12 @@ func (c *consumerGroup) syncGroupRequest(
 	strategy BalanceStrategy,
 ) (*SyncGroupResponse, error) {
 	req := &SyncGroupRequest{
-		GroupId:      c.groupID,
-		MemberId:     c.memberID,
-		GenerationId: generationID,
+		GroupId:         c.groupID,
+		MemberId:        c.memberID,
+		GenerationId:    generationID,
+		GroupInstanceId: c.groupInstanceId,
 	}
-
-	// Versions 1 and 2 are the same as version 0.
-	if c.config.Version.IsAtLeast(V0_11_0_0) {
-		req.Version = 1
-	}
-	if c.config.Version.IsAtLeast(V2_0_0_0) {
-		req.Version = 2
-	}
-	// Starting from version 3, we add a new field called groupInstanceId to indicate member identity across restarts.
-	if c.config.Version.IsAtLeast(V2_3_0_0) {
-		req.Version = 3
-		req.GroupInstanceId = c.groupInstanceId
-	}
+	req.SetVersion(c.config.Version)
 
 	for memberID, topics := range plan {
 		assignment := &ConsumerGroupMemberAssignment{Topics: topics}
@@ -552,23 +524,12 @@ func (c *consumerGroup) syncGroupRequest(
 
 func (c *consumerGroup) heartbeatRequest(coordinator *Broker, memberID string, generationID int32) (*HeartbeatResponse, error) {
 	req := &HeartbeatRequest{
-		GroupId:      c.groupID,
-		MemberId:     memberID,
-		GenerationId: generationID,
+		GroupId:         c.groupID,
+		MemberId:        memberID,
+		GenerationId:    generationID,
+		GroupInstanceId: c.groupInstanceId,
 	}
-
-	// Version 1 and version 2 are the same as version 0.
-	if c.config.Version.IsAtLeast(V0_11_0_0) {
-		req.Version = 1
-	}
-	if c.config.Version.IsAtLeast(V2_0_0_0) {
-		req.Version = 2
-	}
-	// Starting from version 3, we add a new field called groupInstanceId to indicate member identity across restarts.
-	if c.config.Version.IsAtLeast(V2_3_0_0) {
-		req.Version = 3
-		req.GroupInstanceId = c.groupInstanceId
-	}
+	req.SetVersion(c.config.Version)
 
 	return coordinator.Heartbeat(req)
 }
@@ -626,19 +587,11 @@ func (c *consumerGroup) leave() error {
 	req := &LeaveGroupRequest{
 		GroupId:  c.groupID,
 		MemberId: c.memberID,
+		Members: []MemberIdentity{
+			{MemberId: c.memberID},
+		},
 	}
-	if c.config.Version.IsAtLeast(V0_11_0_0) {
-		req.Version = 1
-	}
-	if c.config.Version.IsAtLeast(V2_0_0_0) {
-		req.Version = 2
-	}
-	if c.config.Version.IsAtLeast(V2_4_0_0) {
-		req.Version = 3
-		req.Members = append(req.Members, MemberIdentity{
-			MemberId: c.memberID,
-		})
-	}
+	req.SetVersion(c.config.Version)
 
 	resp, err := coordinator.LeaveGroup(req)
 	if err != nil {

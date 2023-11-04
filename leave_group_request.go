@@ -107,3 +107,17 @@ func (r *LeaveGroupRequest) supportedVersions() (int16, int16) {
 func (r *LeaveGroupRequest) setVersion(v int16) {
 	r.Version = v
 }
+
+func (r *LeaveGroupRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_4_0_0):
+		r.Version = 3
+	case v.IsAtLeast(V2_0_0_0):
+		r.Version = 2
+	case v.IsAtLeast(V0_11_0_0):
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
