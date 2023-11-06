@@ -1844,3 +1844,23 @@ func validServerNameTLS(addr string, cfg *tls.Config) *tls.Config {
 	c.ServerName = sn
 	return c
 }
+
+// TODO: should this be public?
+// TODO: not totally sure I'm happy with the signature of this method
+func (b *Broker) SupportsApiKey(apiKey int16) (bool, int, int, error) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	if b.conn == nil {
+		return false, 0, 0, ErrNotConnected
+	}
+	if b.versions == nil {
+		// Only supported if connected, and config.Version = Automatic.
+		return false, 0, 0, errors.New("SupportsAPI can only be used if config.Versions is set to Automatic")
+	}
+	for _, key := range b.versions.ApiKeys {
+		if apiKey == key.ApiKey {
+			return true, int(key.MinVersion), int(key.MaxVersion), nil
+		}
+	}
+	return false, 0, 0, nil
+}
