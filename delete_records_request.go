@@ -95,6 +95,16 @@ func (d *DeleteRecordsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (d *DeleteRecordsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_0_0_0):
+		d.Version = 1
+	default:
+		d.Version = 0
+	}
+}
+
 func (d *DeleteRecordsRequest) supportedVersions() (int16, int16) {
 	return 0, 1
 }

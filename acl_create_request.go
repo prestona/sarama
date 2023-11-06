@@ -64,6 +64,16 @@ func (c *CreateAclsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (c *CreateAclsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_0_0_0):
+		c.Version = 1
+	default:
+		c.Version = 0
+	}
+}
+
 func (c *CreateAclsRequest) supportedVersions() (int16, int16) {
 	return 0, 1
 }

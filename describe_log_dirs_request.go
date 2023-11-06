@@ -93,6 +93,16 @@ func (r *DescribeLogDirsRequest) requiredVersion() KafkaVersion {
 	return V1_0_0_0
 }
 
+func (r *DescribeLogDirsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_0_0_0):
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *DescribeLogDirsRequest) supportedVersions() (int16, int16) {
 	return 0, 1
 }

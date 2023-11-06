@@ -106,6 +106,23 @@ func (c *CreateTopicsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (c *CreateTopicsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 3 is the same as version 2 (brokers response before throttling)
+		c.Version = 3
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 2 is the same as version 1 (response has ThrottleTime)
+		c.Version = 2
+	case v.IsAtLeast(V0_10_2_0):
+		// Version 1 adds validateOnly.
+		c.Version = 1
+	default:
+		c.Version = 0
+	}
+}
+
 func (r *CreateTopicsRequest) supportedVersions() (int16, int16) {
 	return 0, 3
 }

@@ -41,6 +41,16 @@ func (r *DeleteGroupsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *DeleteGroupsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_0_0_0):
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *DeleteGroupsRequest) supportedVersions() (int16, int16) {
 	return 0, 1
 }

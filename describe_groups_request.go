@@ -63,6 +63,26 @@ func (r *DescribeGroupsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *DescribeGroupsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_4_0_0):
+		// Starting in version 4, the response will include group.instance.id info for members.
+		r.Version = 4
+	case v.IsAtLeast(V2_3_0_0):
+		// Starting in version 3, authorized operations can be requested.
+		r.Version = 3
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 2 is the same as version 0.
+		r.Version = 2
+	case v.IsAtLeast(V1_1_0_0):
+		// Version 1 is the same as version 0.
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *DescribeGroupsRequest) AddGroup(group string) {
 	r.Groups = append(r.Groups, group)
 }

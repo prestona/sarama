@@ -81,6 +81,26 @@ func (r *ListGroupsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (r *ListGroupsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_6_0_0):
+		// Version 4 adds the StatesFilter field (KIP-518).
+		r.Version = 4
+	case v.IsAtLeast(V2_4_0_0):
+		// Version 3 is the first flexible version.
+		r.Version = 3
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 2 is the same as version 0.
+		r.Version = 2
+	case v.IsAtLeast(V0_11_0_0):
+		// Version 1 is the same as version 0.
+		r.Version = 1
+	default:
+		r.Version = 0
+	}
+}
+
 func (r *ListGroupsRequest) supportedVersions() (int16, int16) {
 	return 0, 4
 }

@@ -61,6 +61,20 @@ func (d *DeleteTopicsRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (d *DeleteTopicsRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_1_0_0):
+		d.Version = 3
+	case v.IsAtLeast(V2_0_0_0):
+		d.Version = 2
+	case v.IsAtLeast(V0_11_0_0):
+		d.Version = 1
+	default:
+		d.Version = 0
+	}
+}
+
 func (d *DeleteTopicsRequest) supportedVersions() (int16, int16) {
 	return 0, 3
 }
