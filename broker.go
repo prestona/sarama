@@ -234,8 +234,12 @@ func (b *Broker) Open(conf *Config) error {
 			b.registerMetrics()
 		}
 
+		// TODO: how exactly those APIVersions map to SASL versions? Prior to wrapping SASL in the
+		// Kafka protocol - is that version 0, or something else?
 		var useSaslV0 bool
 		if conf.Version == Automatic {
+			// TODO: should load the versions into a map, as there's no guarantee that a particular
+			// index in ApiVersionResponse will have the value of that API key.
 			b.versions, b.connErr = b.sendAndReceiveV0ApiVersions()
 			if b.connErr != nil {
 				// TODO: this is duplicate code (from the SASLV0 case)
@@ -1031,6 +1035,8 @@ func (b *Broker) sendInternal(rb requestProtocolBody, promise *responsePromise) 
 		// if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
 		// 	return ErrUnsupportedVersion
 		// }
+		// TODO: also need to handle the case where the APIVersions response doesn't have
+		//       an entry for the API key. E.g. the broker doesn't support this method.
 		rb.setVersion(version)
 	} else if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
 		return ErrUnsupportedVersion
