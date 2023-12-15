@@ -183,7 +183,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		return nil, ConfigurationError("You must provide at least one broker address")
 	}
 
-	if strings.Contains(addrs[0], ".servicebus.windows.net") {
+	if strings.Contains(addrs[0], ".servicebus.windows.net") && conf.Version != Automatic {
 		if conf.Version.IsAtLeast(V1_1_0_0) || !conf.Version.IsAtLeast(V0_11_0_0) {
 			Logger.Println("Connecting to Azure Event Hubs, forcing version to V1_0_0_0 for compatibility")
 			conf.Version = V1_0_0_0
@@ -262,20 +262,7 @@ func (client *client) InitProducerID() (*InitProducerIDResponse, error) {
 	brokerErrors := make([]error, 0)
 	for broker := client.LeastLoadedBroker(); broker != nil; broker = client.LeastLoadedBroker() {
 		request := &InitProducerIDRequest{}
-
-		if client.conf.Version.IsAtLeast(V2_7_0_0) {
-			// Version 4 adds the support for new error code PRODUCER_FENCED.
-			request.Version = 4
-		} else if client.conf.Version.IsAtLeast(V2_5_0_0) {
-			// Version 3 adds ProducerId and ProducerEpoch, allowing producers to try to resume after an INVALID_PRODUCER_EPOCH error
-			request.Version = 3
-		} else if client.conf.Version.IsAtLeast(V2_4_0_0) {
-			// Version 2 is the first flexible version.
-			request.Version = 2
-		} else if client.conf.Version.IsAtLeast(V2_0_0_0) {
-			// Version 1 is the same as version 0.
-			request.Version = 1
-		}
+		request.SetVersion(client.conf.Version)
 
 		response, err := broker.InitProducerID(request)
 		if err == nil {
@@ -581,7 +568,7 @@ func (client *client) Controller() (*Broker, error) {
 		return nil, ErrClosedClient
 	}
 
-	if !client.conf.Version.IsAtLeast(V0_10_0_0) {
+	if client.conf.Version == Automatic || !client.conf.Version.IsAtLeast(V0_10_0_0) {
 		return nil, ErrUnsupportedVersion
 	}
 

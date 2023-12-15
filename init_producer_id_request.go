@@ -105,6 +105,26 @@ func (i *InitProducerIDRequest) requiredVersion() KafkaVersion {
 	}
 }
 
+func (i *InitProducerIDRequest) SetVersion(v KafkaVersion) {
+	switch {
+	case v == Automatic:
+	case v.IsAtLeast(V2_7_0_0):
+		// Version 4 adds the support for new error code PRODUCER_FENCED.
+		i.Version = 4
+	case v.IsAtLeast(V2_5_0_0):
+		// Version 3 adds ProducerId and ProducerEpoch, allowing producers to try to resume after an INVALID_PRODUCER_EPOCH error
+		i.Version = 3
+	case v.IsAtLeast(V2_4_0_0):
+		// Version 2 is the first flexible version.
+		i.Version = 2
+	case v.IsAtLeast(V2_0_0_0):
+		// Version 1 is the same as version 0.
+		i.Version = 0
+	default:
+		i.Version = 0
+	}
+}
+
 func (i *InitProducerIDRequest) supportedVersions() (int16, int16) {
 	return 0, 4
 }
