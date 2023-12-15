@@ -443,13 +443,15 @@ func (p *asyncProducer) dispatcher() {
 		}
 
 		version := 1
-		if p.conf.Version.IsAtLeast(V0_11_0_0) {
+		if p.conf.Version == Automatic || p.conf.Version.IsAtLeast(V0_11_0_0) {
+			// Assuming 2 for Automatic introduces a small inaccuracy for 0.10 brokers (which support)
+			// the API versions request - but should really use 1. In this case messages will be rejected
+			// by the client if they are within 10 bytes of Producer.MaxMessageBytes.
 			version = 2
 		} else if msg.Headers != nil {
 			p.returnError(msg, ConfigurationError("Producing headers requires Kafka at least v0.11"))
 			continue
 		}
-
 		size := msg.ByteSize(version)
 		if size > p.conf.Producer.MaxMessageBytes {
 			p.returnError(msg, ConfigurationError(fmt.Sprintf("Attempt to produce message larger than configured Producer.MaxMessageBytes: %d > %d", size, p.conf.Producer.MaxMessageBytes)))
@@ -1087,7 +1089,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		switch block.Err {
 		// Success
 		case ErrNoError:
-			if bp.parent.conf.Version.IsAtLeast(V0_10_0_0) && !block.Timestamp.IsZero() {
+			if (bp.parent.conf.Version == Automatic || bp.parent.conf.Version.IsAtLeast(V0_10_0_0)) && !block.Timestamp.IsZero() {
 				for _, msg := range pSet.msgs {
 					msg.Timestamp = block.Timestamp
 				}
