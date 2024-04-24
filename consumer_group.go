@@ -580,6 +580,7 @@ func (c *consumerGroup) leave() error {
 	}
 
 	// as per KIP-345 if groupInstanceId is set, i.e. static membership is in action, then do not leave group when consumer closed, just clear memberID
+	// TODO: need to gate this if check with a "do we support static membership check?", as we want to remove the test that
 	if c.groupInstanceId != nil {
 		c.memberID = ""
 		return nil
