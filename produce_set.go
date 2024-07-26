@@ -3,6 +3,7 @@ package sarama
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -86,6 +87,8 @@ func (ps *produceSet) add(msg *ProducerMessage) error {
 
 	if ps.parent.conf.Version.IsAtLeast(V0_11_0_0) {
 		if ps.parent.conf.Producer.Idempotent && msg.sequenceNumber < set.recordsToSend.RecordBatch.FirstSequence {
+			// msg.sequenceNumber always seems to be zero. no flags are set in msg
+			fmt.Printf("msg.sequenceNumber=%d < set.recordsToSend.RecordBatch.FirstSequence=%d\n", msg.sequenceNumber, set.recordsToSend.RecordBatch.FirstSequence)
 			return errors.New("assertion failed: message out of sequence added to a batch")
 		}
 	}

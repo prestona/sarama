@@ -666,6 +666,7 @@ func (pp *partitionProducer) dispatch() {
 		} else if pp.highWatermark > 0 {
 			// we are retrying something (else highWatermark would be 0) but this message is not a *new* retry level
 			if msg.retries < pp.highWatermark {
+				fmt.Printf("msg.retries=%d < pp.highWatermark=%d\n", msg.retries, pp.highWatermark)
 				// in fact this message is not even the current retry level, so buffer it for now (unless it's a just a fin)
 				if msg.flags&fin == fin {
 					pp.retryState[msg.retries].expectChaser = false
@@ -675,12 +676,15 @@ func (pp *partitionProducer) dispatch() {
 				}
 				continue
 			} else if msg.flags&fin == fin {
+				fmt.Printf("msg.flags&fin\n")
 				// this message is of the current retry level (msg.retries == highWatermark) and the fin flag is set,
 				// meaning this retry level is done and we can go down (at least) one level and flush that
 				pp.retryState[pp.highWatermark].expectChaser = false
 				pp.flushRetryBuffers()
 				pp.parent.inFlight.Done() // this fin is now handled and will be garbage collected
 				continue
+			} else {
+				fmt.Printf("pp.highWatermark=%d > 0\n", pp.highWatermark)
 			}
 		}
 
@@ -703,12 +707,14 @@ func (pp *partitionProducer) dispatch() {
 			pp.parent.txnmgr.maybeAddPartitionToCurrentTxn(pp.topic, pp.partition)
 		}
 
+		fmt.Printf("dispatching brokerProducer=%p\n", pp.brokerProducer)
 		pp.brokerProducer.input <- msg
 	}
 }
 
 func (pp *partitionProducer) newHighWatermark(hwm int) {
 	Logger.Printf("producer/leader/%s/%d state change to [retrying-%d]\n", pp.topic, pp.partition, hwm)
+	fmt.Printf("old highWatermark: %d, new highWatermark: %d\n", pp.highWatermark, hwm)
 	pp.highWatermark = hwm
 
 	// send off a fin so that we know when everything "in between" has made it
@@ -737,6 +743,7 @@ func (pp *partitionProducer) flushRetryBuffers() {
 		}
 
 		for _, msg := range pp.retryState[pp.highWatermark].buf {
+			fmt.Println("flush retry")
 			pp.brokerProducer.input <- msg
 		}
 
