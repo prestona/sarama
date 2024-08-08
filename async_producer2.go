@@ -1,10 +1,6 @@
 package sarama
 
-import (
-	"errors"
-	"sync"
-	"time"
-)
+import "time"
 
 func NewAsyncProducer2(addrs []string, conf *Config) (AsyncProducer, error) {
 	client, err := NewClient(addrs, conf)
@@ -22,14 +18,24 @@ func NewAsyncProducerFromClient2(client Client) (AsyncProducer, error) {
 }
 
 type asyncProducer2 struct {
-	config           *Config
-	errors           chan *ProducerError
-	input, successes chan *ProducerMessage
+	config            *Config
+	errors            chan *ProducerError
+	input, successes  chan *ProducerMessage
+	refreshMetadata   chan string
+	metadataRefreshed chan struct{}
+	waitFor           chan time.Duration
+	produceCompleted  chan *asyncProduceResult
+	client            Client
 
-	client Client
-
-	mu             *sync.Mutex
-	topicProducers map[string]*topicProducer2
+	// TODO: the following are only touched by the goroutine running dispatchInput()
+	// TODO: split out into another struct
+	awaitingPartitioning map[string]*deque[*producerFuture, producerFuture]
+	awaitingLeader       map[string]*deque[*producerFuture, producerFuture]
+	accumulator          *batchAccumulator
+	inflight             map[int32]*deque[*batch, batch]
+	drainInflight        bool
+	batchTicker          *time.Ticker
+	batchTickerRunning   bool
 }
 
 func newAsyncProducer2(client Client) (AsyncProducer, error) {
@@ -38,12 +44,26 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 	}
 
 	p := &asyncProducer2{
-		config:    client.Config(),
-		client:    client,
-		errors:    make(chan *ProducerError),
-		input:     make(chan *ProducerMessage),
-		successes: make(chan *ProducerMessage),
+		config:            client.Config(),
+		client:            client,
+		errors:            make(chan *ProducerError),
+		input:             make(chan *ProducerMessage),
+		successes:         make(chan *ProducerMessage),
+		refreshMetadata:   make(chan string),
+		metadataRefreshed: make(chan struct{}),
+		waitFor:           make(chan time.Duration),
+		produceCompleted:  make(chan *asyncProduceResult),
+
+		awaitingPartitioning: map[string]*deque[*producerFuture, producerFuture]{},
+		awaitingLeader:       map[string]*deque[*producerFuture, producerFuture]{},
+		accumulator:          netBatchAccumulator(),
+		inflight:             map[int32]*deque[*batch, batch]{},
+		drainInflight:        false,
+		batchTicker:          time.NewTicker(100 * time.Millisecond), // TODO: set this from config
+		batchTickerRunning:   false,
 	}
+	p.batchTicker.Stop()
+
 	go p.dispatchInput()
 	return p, nil
 }
@@ -83,43 +103,287 @@ func (ap *asyncProducer2) AddMessageToTxn(msg *ConsumerMessage, groupId string, 
 	return nil
 }
 
-// dispatchInput translates the input channel to a series of calls to the send() method.
-// It also ensures that the futures returned by the send method are translated into enqueuing
-// results into the appropriate success / error channels. dispatchInput is run using a
-// goroutine that is created by newAsyncProducer2().
-func (ap *asyncProducer2) dispatchInput() {
-	for msg := range ap.input {
-		f := ap.send(msg)
-		f.onCompletion(func(msg *ProducerMessage, err error) {
-			if err != nil {
-				ap.errors <- &ProducerError{
-					Msg: msg,
-					Err: err,
-				}
-				return
-			}
-			ap.successes <- msg
-		})
-	}
-}
-
-// send partitions messages by the topic they are being sent to, and passes the
-func (ap *asyncProducer2) send(msg *ProducerMessage) *producerFuture {
-	tp := ap.topicProducerFor(msg.Topic)
+// TODO: rename something like "wrapWithFuture"
+func (ap *asyncProducer2) setupFuture(msg *ProducerMessage) *producerFuture {
 	f := newProducerFuture(msg)
-	tp.send(f)
+	f.onCompletion(func(msg *ProducerMessage, err error) {
+		if err != nil {
+			ap.errors <- &ProducerError{
+				Msg: msg,
+				Err: err,
+			}
+			return
+		}
+		ap.successes <- msg
+	})
 	return f
 }
 
-func (ap *asyncProducer2) topicProducerFor(topic string) *topicProducer2 {
-	ap.mu.Lock()
-	defer ap.mu.Unlock()
-	tp := ap.topicProducers[topic]
-	if tp == nil {
-		tp = newTopicProducer(ap.client, topic)
-		ap.topicProducers[topic] = tp
+// TODO: currently there's no escape from this if a message persistently can't be partitioned
+func (ap *asyncProducer2) processAwaitingPartitioning() bool {
+	needMetadataRefresh := false
+	for _, pq := range ap.awaitingPartitioning {
+		for !pq.empty() {
+			f := pq.peek()
+			if err := ap.partitionMessage(f.msg); err != nil {
+				needMetadataRefresh = true
+				break
+			}
+			pq.remove()
+
+			if lq, ok := ap.awaitingLeader[f.msg.Topic]; !ok {
+				ap.awaitingLeader[f.msg.Topic] = newDeque[*producerFuture, producerFuture](f)
+			} else {
+				lq.add(f)
+			}
+		}
 	}
-	return tp
+
+	return needMetadataRefresh
+}
+
+// TODO: currently there's no escape from this if a message persistently can't find a leader
+func (ap *asyncProducer2) processAwaitingLeader() bool {
+	needMetadataRefresh := false
+	for _, lq := range ap.awaitingLeader {
+		for !lq.empty() {
+			f := lq.peek()
+			broker, brokerEpoc, err := ap.client.LeaderAndEpoch(f.msg.Topic, f.msg.Partition)
+			if err != nil {
+				needMetadataRefresh = true
+				break
+			}
+			lq.remove()
+
+			ap.accumulator.add(f, broker.ID(), brokerEpoc)
+		}
+	}
+
+	return needMetadataRefresh
+}
+
+func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
+	broker, err := ap.client.Broker(brokerID)
+	if err != nil {
+		// Handle all outcomes in the same way: another goroutine invoking asyncProducerCallback.
+		go ap.asyncProduceCallback(b, nil, err)
+	}
+	request := &ProduceRequest{}
+	// TODO: now need to think about how to assign sequence numbers to batches.
+
+	err = broker.AsyncProduce(request, func(resp *ProduceResponse, err error) {
+		ap.asyncProduceCallback(b, resp, err)
+	})
+	if err != nil || request.RequiredAcks == NoResponse {
+		// AsyncProduce doesn't invoke the callback for acks=0 so make sure asyncProduceCallback
+		// is notified that the produce has been attempted.
+		go ap.asyncProduceCallback(b, nil, err)
+	}
+}
+
+// asyncProduceCallback is called in response to producing a message using the Broker.AsyncProduce(...) method.
+// As this method is used across a number of Brokers, it can be called concurrently on multiple goroutines.
+// The response argument can be nil if the produce request was with acks=0
+func (ap *asyncProducer2) asyncProduceCallback(batch *batch, response *ProduceResponse, err error) {
+	ap.produceCompleted <- &asyncProduceResult{
+		batch:    batch,
+		response: response,
+		err:      err,
+	}
+}
+
+type asyncProduceResult struct {
+	batch    *batch
+	response *ProduceResponse
+	err      error
+}
+
+const maxInflight = 3 // TODO: get this from configuration
+
+func (ap *asyncProducer2) maybeProduceBatches() {
+	// Try to assign partitions to any futures awaiting partitioning, and find leaders for any awaiting a leader
+	updateMetadata := ap.processAwaitingPartitioning()
+	updateMetadata = updateMetadata || ap.processAwaitingLeader()
+	if updateMetadata {
+		// If some futures couldn't be partitioned or don't have a leader, trigger a metadata refresh.
+		ap.refreshMetadata <- "x" // TODO: wrong type for channel? Or wrong return type from processX functions?
+	}
+
+	// TODO: tickers will panic if passed a zero duration - is that ever a valid configuration for Sarama?
+	if ap.accumulator.hasIncompleteBatches() && !ap.batchTickerRunning {
+		ap.batchTicker.Reset(100 * time.Millisecond) // TODO: get this from config
+		ap.batchTickerRunning = true                 // TODO: maybe wrap this and the ticker into a struct to make tracking this easier...
+	} else if !ap.accumulator.hasIncompleteBatches() && ap.batchTickerRunning {
+		ap.batchTicker.Stop()
+		ap.batchTickerRunning = false
+	}
+
+	// If the in-flight messages are being drained, then there is nothing left to do.
+	// Transitioning out of draining will occur when notified that the last of the batches has been processed
+	if ap.drainInflight {
+		return
+	}
+
+	// See if there is capacity to move accumulated batches into inflight.
+	for _, brokerID := range ap.accumulator.brokerIDs() {
+		inflightForBroker, ok := ap.inflight[brokerID]
+		if !ok {
+			inflightForBroker = newDeque[*batch, batch]()
+			ap.inflight[brokerID] = inflightForBroker
+		}
+		for inflightForBroker.size() <= maxInflight {
+			b := ap.accumulator.poll(brokerID)
+			if b == nil {
+				break
+			}
+			inflightForBroker.add(b)
+			ap.sendToBroker(brokerID, b)
+		}
+	}
+}
+
+func updateInflightStatus(produceResult *asyncProduceResult) {
+	if produceResult.batch.resolved {
+		panic("batch has already been resolved!") // TODO: convert to log line (or something) once the code has been debugged.
+	}
+	if produceResult.err != nil {
+		produceResult.batch.failAll(produceResult.err)
+		return
+	}
+	if produceResult.response != nil {
+		// TODO: work out what to do based on the individual responses.
+		for topic, partitionToResponse := range produceResult.response.Blocks {
+			for partition, responseBlock := range partitionToResponse {
+				if responseBlock.Err != ErrNoError &&
+					responseBlock.Err != ErrDuplicateSequenceNumber { // TODO: explain the significance of this...
+					produceResult.batch.fail(topic, partition, responseBlock.Err)
+				}
+			}
+		}
+	}
+	produceResult.batch.resolved = true
+}
+
+func (ap *asyncProducer2) maybeRemoveInFlightBatches() { // TODO: complete might be a better term?
+	// TODO: where are we toggling the drain flag?
+
+	for _, batches := range ap.inflight {
+		for !batches.empty() {
+
+		}
+	}
+}
+
+// dispatchInput...
+func (ap *asyncProducer2) dispatchInput() {
+	for {
+		select {
+		case msg := <-ap.input:
+			// a new message has been passed to the async producer via its input channel
+			// create a future for it
+			f := ap.setupFuture(msg)
+
+			// Add the future to those awaiting partitioning
+			if pq, ok := ap.awaitingPartitioning[msg.Topic]; !ok {
+				ap.awaitingPartitioning[msg.Topic] = newDeque[*producerFuture, producerFuture](f)
+			} else {
+				pq.add(f)
+			}
+
+		case <-ap.metadataRefreshed:
+			// metadata has been refreshed - see if this allows for more batches to be ready
+			// to produce
+
+		case <-ap.batchTicker.C:
+			// deadline for time based batch completion has been reached - see if this has
+			// caused more batches to become ready to produce.
+
+		case produceResult := <-ap.produceCompleted:
+			updateInflightStatus(produceResult)
+			ap.maybeRemoveInFlightBatches()
+		}
+
+		ap.maybeProduceBatches()
+	}
+}
+
+// func (ap *asyncProducer2) reattemptPartitioning(map[string])
+
+func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) error {
+	partitioner := ap.config.Producer.Partitioner(msg.Topic) // TODO: building this on each call is inefficient...
+	var partitions []int32
+
+	requiresConsistency := false
+	if ep, ok := partitioner.(DynamicConsistencyPartitioner); ok {
+		requiresConsistency = ep.MessageRequiresConsistency(msg)
+	} else {
+		requiresConsistency = partitioner.RequiresConsistency()
+	}
+
+	var err error
+	if requiresConsistency {
+		partitions, err = ap.client.Partitions(msg.Topic)
+	} else {
+		partitions, err = ap.client.WritablePartitions(msg.Topic)
+	}
+	if err != nil {
+		return err
+	}
+
+	numPartitions := int32(len(partitions))
+	if numPartitions == 0 {
+		return ErrLeaderNotAvailable
+	}
+
+	choice, err := partitioner.Partition(msg, numPartitions)
+
+	if err != nil {
+		return err
+	} else if choice < 0 || choice >= numPartitions {
+		return ErrInvalidPartition // TODO: some of these errors should be hard failures for the message.
+	}
+
+	msg.Partition = partitions[choice]
+
+	return nil
+}
+
+// ================================================================================
+
+// ><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><
+// Need to change how this works:
+// 1. Accumulator should internally track records by a deque keyed on topic/partition
+// ** actually will doing 1. cause any ordering / fairness problems? **
+// 2. It should also remember the broker ID associated with a topic/partition, and respond if this is ever changed.
+//    Specifically: it should throw away any batches that it hasn't emitted for the changed broker
+// 3. Getting batches out of the accumulator (e.g. poll) should be done one at a time (or with a bound) and
+//    be polled per-broker ID. This might make determining the time to wait until there might be a completed batch
+//    a bit more difficult.
+// ><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><
+
+type batchAccumulator struct{}
+
+func netBatchAccumulator() *batchAccumulator {
+	return &batchAccumulator{}
+}
+
+func (ba *batchAccumulator) add(future *producerFuture, brokerID int32, brokerEpoc int32) {
+
+}
+
+// brokerIDs returns the broker IDs for which the accumulator has ready batches
+func (ba *batchAccumulator) brokerIDs() []int32 {
+	return nil
+}
+
+// poll() returns:
+// - a map of topic -> partition -> deque of messages (can be nil if there aren't any ready batches)
+func (ba *batchAccumulator) poll(brokerID int32) *batch {
+	return nil
+}
+
+func (ba *batchAccumulator) hasIncompleteBatches() bool {
+	return false
 }
 
 // ================================================================================
@@ -144,384 +408,51 @@ func (pf *producerFuture) fail(err error) {
 }
 
 // ================================================================================
-type topicProducer2 struct {
-	config      *Config
-	partitioner Partitioner
-	client      Client
-
-	mu     *sync.Mutex
-	cond   *sync.Cond
-	queue  []*producerFuture
-	closed bool
-
-	// TODO: doesn't need a lock, as only handled by the dispatch go-routine
-	accumulators map[int32]*batchAccumulator
+type deque[T *Q, Q any] struct {
+	elements []T
 }
 
-func newTopicProducer(client Client, topic string) *topicProducer2 {
-	config := client.Config()
-	mu := &sync.Mutex{}
-	tp := &topicProducer2{
-		config:      config,
-		client:      client,
-		partitioner: config.Producer.Partitioner(topic),
-		cond:        sync.NewCond(mu),
+func newDeque[T *Q, Q any](vs ...T) *deque[T, Q] {
+	elements := make([]T, len(vs))
+	copy(elements, vs)
+	return &deque[T, Q]{
+		elements: elements,
 	}
-	go tp.dispatchTopic()
-	return tp
 }
 
-func (tp *topicProducer2) send(future *producerFuture) {
-	tp.enqueue(future)
-	tp.wake()
+func (d *deque[T, Q]) add(v ...T) {
+	d.elements = append(d.elements, v...)
 }
 
-func (tp *topicProducer2) enqueue(future *producerFuture) {
-	tp.mu.Lock()
-	defer tp.mu.Unlock()
-	if tp.closed {
-		future.fail(ErrClosedClient)
-		return
-	}
-	tp.queue = append(tp.queue, future)
-}
-
-func (tp *topicProducer2) wake() {
-	tp.cond.Signal()
-}
-
-func (tp *topicProducer2) dequeue() *producerFuture {
-	tp.cond.L.Lock()
-	defer tp.cond.L.Unlock()
-	if len(tp.queue) <= 1 {
-		tp.queue = nil
+func (d *deque[T, Q]) peek() T {
+	if len(d.elements) == 0 {
+		// TODO: should this be an error?
 		return nil
 	}
-	tp.queue = tp.queue[1:]
-	return tp.queue[0]
+	return d.elements[len(d.elements)-1]
 }
 
-func (tp *topicProducer2) dispatchTopic() {
-	var future *producerFuture
-	for {
-		if future == nil {
-			tp.cond.Wait()
-			if tp.closed {
-				for _, f := range tp.queue {
-					f.fail(ErrClosedClient)
-				}
-				tp.queue = nil
-				tp.cond.L.Unlock()
-				for _, acc := range tp.accumulators {
-					acc.close()
-				}
-				tp.accumulators = nil
-				return
-			}
-			if len(tp.queue) > 0 {
-				future = tp.queue[0]
-			}
-			tp.cond.L.Unlock()
-		}
-
-		if future == nil {
-			continue // TODO: can this actually happen? Probably once we introduce a time aspect to retrying / batching
-		}
-
-		retry, err := tp.partition(future)
-		if err != nil && retry {
-			future.retries++
-			if future.retries > tp.config.Producer.Retry.Max {
-				future.fail(errors.New("too many retries")) // TODO: better name?
-				future = tp.dequeue()
-				continue
-			} else {
-				// TODO: set a timer to wake up on
-				future = nil
-				continue
-			}
-		} else if err != nil /* && !retry */ {
-			future.fail(err)
-			future = tp.dequeue()
-			continue
-		}
-
-		msg := future.msg
-		acc := tp.accumulators[msg.Partition]
-		if acc == nil {
-			pp := newPartitionProducer2(tp.client, msg.Topic, msg.Partition)
-			acc := newBatchAccumulator(pp)
-			tp.accumulators[msg.Partition] = acc
-		}
-		acc.input <- future
-
-		future = tp.dequeue()
+func (d *deque[T, Q]) remove() T {
+	if len(d.elements) == 0 {
+		// TODO: should this be an error?
+		return nil
 	}
+	v := d.peek()
+	d.elements = d.elements[:len(d.elements)-1]
+	return v
 }
 
-func (tp *topicProducer2) close() {
-	tp.cond.L.Lock()
-	tp.closed = true
-	tp.cond.L.Unlock()
-	tp.wake()
-	// TODO: wait until the dispatch go-routine exits
+func (d *deque[T, Q]) empty() bool {
+	return len(d.elements) == 0
 }
 
-func (tp *topicProducer2) partition(future *producerFuture) (bool, error) {
-	msg := future.msg
-	requiresConsistency := tp.partitioner.RequiresConsistency()
-	if dynamic, ok := tp.partitioner.(DynamicConsistencyPartitioner); ok {
-		requiresConsistency = dynamic.MessageRequiresConsistency(msg)
-	}
-
-	var partitions []int32
-	var err error
-	if requiresConsistency {
-		partitions, err = tp.client.Partitions(msg.Topic)
-	} else {
-		partitions, err = tp.client.WritablePartitions(msg.Topic)
-	}
-	if err != nil {
-		return true, err
-	}
-
-	numPartitions := int32(len(partitions))
-	if numPartitions == 0 {
-		return true, ErrLeaderNotAvailable
-	}
-
-	choice, err := tp.partitioner.Partition(msg, numPartitions)
-	if err != nil {
-		return false, err
-	}
-	if choice < 0 || choice >= numPartitions {
-		return false, ErrInvalidPartition
-	}
-
-	msg.Partition = partitions[choice]
-	return false, nil
+func (d *deque[T, Q]) size() int {
+	return len(d.elements)
 }
 
-// ================================================================================
-type batchAccumulator struct {
-	input chan *producerFuture
-	pp    *partitionProducer2
-}
-
-func newBatchAccumulator(pp *partitionProducer2) *batchAccumulator {
-	ba := &batchAccumulator{
-		input: make(chan *producerFuture),
-		pp:    pp,
-	}
-	go ba.dispatchToPartition()
-	return ba
-}
-
-func (ba *batchAccumulator) dispatchToPartition() {
-	var current *batch
-	var timer *time.Timer
-	var timerCh <-chan time.Time
-outer:
-	for {
-		select {
-		case future, ok := <-ba.input:
-			if !ok {
-				break outer
-			}
-			if current == nil {
-				current = newBatch()
-				timer = time.NewTimer(100 * time.Millisecond) // TODO: get this value from the config.
-				timerCh = timer.C
-			}
-			current.add(future)
-
-			if current.ready() {
-				ba.pp.send(current)
-				current = nil
-				timer.Stop() // TODO: might be possible to do this more efficiently with restart()
-				timerCh = nil
-			}
-		case <-timerCh:
-			ba.pp.send(current)
-			current = nil
-			timer = nil
-			timerCh = nil
-		}
-	}
-
-	current.err = errors.New("shutting down")
-	current.fail()
-
-	ba.pp.close()
-}
-
-func (ba *batchAccumulator) close() {
-	close(ba.input)
-}
-
-// ================================================================================
-type partitionProducer2 struct {
-	client     Client
-	closed     bool
-	topic      string
-	partition  int32
-	maxRetries int
-	backoff    time.Duration
-
-	cond    sync.Cond
-	current *batch
-	ready   []*batch
-}
-
-func newPartitionProducer2(client Client, topic string, partition int32) *partitionProducer2 {
-	config := client.Config()
-	pp := &partitionProducer2{
-		client:     client,
-		topic:      topic,
-		partition:  partition,
-		maxRetries: config.Producer.Retry.Max,
-		backoff:    config.Producer.Retry.Backoff, // TODO: ignoring backoffFunc
-		cond:       *sync.NewCond(&sync.Mutex{}),
-		current:    newBatch(),
-		ready:      []*batch{},
-	}
-	go pp.dispatchToPartition()
-	return pp
-}
-
-func (pp *partitionProducer2) send(batch *batch) {
-	closed := false
-	pp.cond.L.Lock()
-	if pp.closed {
-		closed = true
-	} else {
-		pp.ready = append(pp.ready, batch)
-	}
-	pp.cond.L.Unlock()
-
-	if closed {
-		batch.err = errors.New("closed")
-		batch.fail()
-	} else {
-		pp.wake()
-	}
-}
-
-func (pp *partitionProducer2) wibble(maxInFlight int) (succeeded, failed, toSend []*batch, refreshLeader bool) {
-	newReady := []*batch{}
-	inFlight := 0
-	for _, batch := range pp.ready {
-		if inFlight == maxInFlight {
-			return succeeded, failed, toSend, refreshLeader
-		}
-		switch batch.status {
-		case batchNotSent:
-			newReady = append(newReady, batch)
-			batch.status = batchInFlight
-			toSend = append(toSend, batch)
-		case batchFailed:
-			batch.retries++
-			if errors.Is(batch.err, ErrNotLeaderForPartition) {
-				// Don't count this against the retries
-				batch.retries--
-				refreshLeader = true
-			} else if errors.Is(batch.err, ErrDuplicateSequenceNumber) {
-				// Not really an error - treat as success
-				succeeded = append(succeeded, batch)
-				continue
-			} else if batch.retries > pp.maxRetries {
-				failed = append(failed, batch)
-				continue
-			} else {
-				// Assume not retry-able, and refresh the leader
-				refreshLeader = true
-			}
-			newReady = append(newReady, batch)
-			batch.status = batchInFlight
-			batch.err = nil
-			toSend = append(toSend, batch)
-		case batchSuccessful:
-			succeeded = append(succeeded, batch)
-		case batchInFlight:
-			newReady = append(newReady, batch)
-		}
-	}
-	pp.ready = newReady
-
-	return succeeded, failed, toSend, refreshLeader
-}
-
-func (pp *partitionProducer2) dispatchToPartition() {
-	var leader *Broker
-	for {
-		var succeeded, failed, toSend []*batch
-		var refreshLeader bool
-		pp.cond.L.Lock()
-		for {
-			succeeded, failed, toSend, refreshLeader = pp.wibble(999)
-			if len(succeeded) == 0 && len(failed) == 0 && len(toSend) == 0 && !refreshLeader {
-				// Nothing to do, wait until signalled
-				pp.cond.Wait()
-				continue
-			}
-			pp.cond.L.Unlock()
-			break
-		}
-
-		for _, batch := range succeeded {
-			batch.success()
-		}
-
-		for _, batch := range failed {
-			batch.fail()
-		}
-
-		if refreshLeader && leader != nil {
-			leader.Close()
-			leader = nil
-		}
-
-		for _, batch := range toSend {
-			if leader == nil {
-				var err error
-				leader, err = pp.client.Leader(pp.topic, pp.partition)
-				if err != nil {
-					pp.updateBatchStatus(batch, batchFailed, err)
-					time.Sleep(pp.backoff)
-					break
-				}
-			}
-
-			leader.AsyncProduce(batch.toProduceRequest(), func(resp *ProduceResponse, err error) {
-				if err != nil {
-					pp.updateBatchStatus(batch, batchFailed, err)
-				} else if resp.Blocks[pp.topic][pp.partition].Err != ErrNoError {
-					pp.updateBatchStatus(batch, batchFailed, resp.Blocks[pp.topic][pp.partition].Err)
-				} else {
-					pp.updateBatchStatus(batch, batchSuccessful, nil)
-				}
-				pp.wake()
-			})
-		}
-	}
-}
-
-func (pp *partitionProducer2) updateBatchStatus(batch *batch, newStatus batchStatus, err error) {
-	pp.cond.L.Lock()
-	defer pp.cond.L.Lock()
-	batch.status = newStatus
-	batch.err = err
-}
-
-func (pp *partitionProducer2) wake() {
-	pp.cond.Signal()
-}
-
-func (pp *partitionProducer2) close() {
-	pp.cond.L.Lock()
-	pp.closed = true
-	pp.cond.L.Unlock()
-	pp.wake()
+func (d *deque[T, Q]) get(idx int) T {
+	// TODO: no bounds check, we just panic.
+	return d.elements[idx]
 }
 
 // ================================================================================
@@ -535,31 +466,53 @@ const (
 )
 
 type batch struct {
-	status  batchStatus
-	err     error
-	retries int
+	// topic name -> partition idx -> deque of futures
+	futures map[string]map[int32]*deque[*producerFuture, producerFuture]
+	// topic name -> partition idx -> KError
+	topicPartitionErrors map[string]map[int32]KError
+	// top level err. If this is set then all topic/partitions failed.
+	err         error
+	hasFailures bool
+	created     time.Time
+	resolved    bool // TODO: not a good name - means that we've determined the outcome of sending this batch.
 }
 
 func newBatch() *batch {
-	return &batch{}
+	return &batch{
+		futures:              nil,
+		topicPartitionErrors: map[string]map[int32]KError{},
+	}
 }
 
 func (b *batch) add(future *producerFuture) {
-
+	if b.futures == nil {
+		b.created = time.Now()
+		b.futures = map[string]map[int32]*deque[*producerFuture, producerFuture]{}
+	}
+	partitionToFutures, ok := b.futures[future.msg.Topic]
+	if !ok {
+		partitionToFutures = map[int32]*deque[*producerFuture, producerFuture]{}
+		b.futures[future.msg.Topic] = partitionToFutures
+	}
+	q, ok := partitionToFutures[future.msg.Partition]
+	if !ok {
+		q = newDeque[*producerFuture, producerFuture]()
+		partitionToFutures[future.msg.Partition] = q
+	}
+	q.add(future)
 }
 
-func (b *batch) ready() bool {
-	return false
+func (b *batch) failAll(err error) {
+	b.err = err
+	b.hasFailures = true
 }
 
-func (b *batch) toProduceRequest() *ProduceRequest {
-	return nil
-}
-
-func (b *batch) fail() {
-
-}
-
-func (b *batch) success() {
-
+func (b *batch) fail(topic string, partition int32, err KError) {
+	b.hasFailures = true
+	partitionToError, ok := b.topicPartitionErrors[topic]
+	if !ok {
+		partitionToError = map[int32]KError{}
+		b.topicPartitionErrors[topic] = partitionToError
+	}
+	partitionToError[partition] = err
 }
