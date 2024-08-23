@@ -1,8 +1,10 @@
 package sarama
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -40,8 +42,8 @@ type asyncProducer2 struct {
 	produceCompleted  chan *asyncProduceResult
 	client            Client
 
-	producerID int64
-	idempotent bool // TODO:
+	producerID    int64
+	producerEpoch int16
 
 	// TODO: the following are only touched by the goroutine running dispatchInput()
 	// TODO: split out into another struct
@@ -52,7 +54,8 @@ type asyncProducer2 struct {
 	drainInflight        bool
 	batchTicker          *time.Ticker
 	batchTickerRunning   bool
-	nextSequenceNum      map[topicPartition]int32
+	lastSuccessfulSeqNum map[topicPartition]int64
+	nextSequenceNum      map[topicPartition]int64
 }
 
 type inflightInfo struct {
@@ -78,16 +81,16 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		produceCompleted:  make(chan *asyncProduceResult),
 
 		producerID: noProducerID,
-		idempotent: config.Producer.Idempotent, // TODO: do we need this, or should we just us config?
 
 		awaitingPartitioning: map[string]*deque[*producerFuture, producerFuture]{},
 		awaitingLeader:       map[string]*deque[*producerFuture, producerFuture]{},
-		accumulator:          netBatchAccumulator(),
+		accumulator:          netBatchAccumulator(config),
 		inflight:             map[int32]*inflightInfo{},
 		drainInflight:        false,
 		batchTicker:          time.NewTicker(100 * time.Millisecond), // TODO: set this from config
 		batchTickerRunning:   false,
-		nextSequenceNum:      map[topicPartition]int32{}, // TODO: make use of this...
+		lastSuccessfulSeqNum: map[topicPartition]int64{},
+		nextSequenceNum:      map[topicPartition]int64{},
 	}
 	p.batchTicker.Stop()
 
@@ -105,6 +108,7 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 			return nil, err
 		}
 		p.producerID = resp.ProducerID
+		p.producerEpoch = resp.ProducerEpoch
 	}
 
 	go p.dispatchInput()
@@ -210,9 +214,8 @@ func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
 		// Handle all outcomes in the same way: another goroutine invoking asyncProducerCallback.
 		go ap.asyncProduceCallback(b, nil, err)
 	}
-	request := b.produceRequest()
-	// TODO: now need to think about how to assign sequence numbers to batches.
 
+	request := b.produceRequest(ap.config, ap.producerEpoch, ap.nextSequenceNum)
 	err = broker.AsyncProduce(request, func(resp *ProduceResponse, err error) {
 		ap.asyncProduceCallback(b, resp, err)
 	})
@@ -315,6 +318,8 @@ func updateInflightStatus(produceResult *asyncProduceResult) {
 	}
 }
 
+// TODO: in general this method is a bit sprawling, and the logic is somewhat haphazardly split
+// across int the completeFailedBatches method.
 func (ap *asyncProducer2) completeInFlightBatches() {
 	for brokerID, brokerInFlight := range ap.inflight {
 		// Start at the oldest in-flight batch, skipping any muted brokers:
@@ -328,6 +333,8 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 					brokerInFlight.muted = true
 					break
 				} else {
+					headBatch.updateLastSuccessfulSequenceNumber(ap.lastSuccessfulSeqNum)
+					headBatch.processSuccesses()
 					brokerInFlight.batches.removeFirst()
 				}
 			} else {
@@ -362,10 +369,34 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 			continue
 		}
 
-		// Retry any retry-able batches, empty out the inf-lights and un-mute the broker again
+		// Remember which topic/partitions might need their sequence numbers reset
+		maybeNeedSeqNumReset := map[topicPartition]any{}
+		for i := 0; i < brokerInFlight.batches.size(); i++ {
+			b := brokerInFlight.batches.get(i)
+			for _, tp := range b.topicPartitions() {
+				maybeNeedSeqNumReset[tp] = struct{}{}
+			}
+		}
+
+		// Retry any retry-able batches, empty out the in-flights
 		ap.completeFailedBatches(brokerID, brokerInFlight.batches)
 		brokerInFlight.batches = newDeque[*batch, batch]()
 		brokerInFlight.muted = false // TODO: should the un-mute be done based on a timer?
+
+		// Reset sequence numbers to one beyond the last successful batch's last sequence number
+		// TODO: this can only be done once completeFailedBatches has been called because that
+		// function also marks partially failed batches as success - however we have to build the list of
+		// topic partitions that might need a reset first because completing the batch and invoking
+		// callbacks also wipes the partition from the batch. Hence the comment at the start of
+		// this method about it being a bit of a jumble.
+		for tp := range maybeNeedSeqNumReset {
+			v, ok := ap.lastSuccessfulSeqNum[tp]
+			if ok {
+				ap.nextSequenceNum[tp] = v + 1
+			} else {
+				ap.nextSequenceNum[tp] = 0
+			}
+		}
 	}
 }
 
@@ -379,6 +410,7 @@ func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *deque[
 	isFirst := true
 	for idx := 0; idx < inflight.size(); idx++ {
 		batch := inflight.get(idx)
+		batch.updateLastSuccessfulSequenceNumber(ap.lastSuccessfulSeqNum)
 		batch.processSuccesses() // if any partitions completed successfully, then mark their futures as successful, and remove them from the batch
 		for tp, err := range batch.topicPartitionErrors {
 			if !isRetryable(isFirst, err) {
@@ -453,8 +485,6 @@ func (ap *asyncProducer2) dispatchInput() {
 	}
 }
 
-// func (ap *asyncProducer2) reattemptPartitioning(map[string])
-
 func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) error {
 	partitioner := ap.config.Producer.Partitioner(msg.Topic) // TODO: building this on each call is inefficient...
 	var partitions []int32
@@ -496,9 +526,10 @@ func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) error {
 
 // ================================================================================
 type batchAccumulator struct {
+	config         *Config
 	leaders        map[topicPartition]*leaderInfo
-	currentBatches map[int32]*batch      // brokerID -> current (incomplete) batch
-	readyBatches   map[int32]*batchDeque //brokerID -> deque of ready batches
+	currentBatches map[int32]*partialBatch // brokerID -> current (incomplete) batch
+	readyBatches   map[int32]*batchDeque   //brokerID -> deque of ready batches
 }
 
 type leaderInfo struct {
@@ -506,10 +537,11 @@ type leaderInfo struct {
 	leaderEpoch int32
 }
 
-func netBatchAccumulator() *batchAccumulator {
+func netBatchAccumulator(config *Config) *batchAccumulator {
 	return &batchAccumulator{
+		config:         config,
 		leaders:        map[topicPartition]*leaderInfo{},
-		currentBatches: map[int32]*batch{},
+		currentBatches: map[int32]*partialBatch{},
 		readyBatches:   map[int32]*batchDeque{},
 	}
 }
@@ -552,20 +584,36 @@ func (ba *batchAccumulator) add(future *producerFuture, brokerID int32, leaderEp
 	}
 
 	cb, ok := ba.currentBatches[brokerID]
-	if !ok {
-		cb = newBatch()
+	if !ok { // TODO: can this pattern be abstracted into a function that uses generics?
+		cb = &partialBatch{
+			batch: newBatch(),
+		}
 		ba.currentBatches[brokerID] = cb
 	}
-	cb.add(future)
-	if cb.isFull() {
-		ready, ok := ba.readyBatches[brokerID]
-		if !ok {
-			ready = newBatchDeque()
-			ba.readyBatches[brokerID] = ready
+
+	if !cb.add(ba.config, future) {
+		// Adding the future to the current batch would overflow
+		ba.addReadyBatch(brokerID, ba.currentBatches[brokerID].batch)
+		cb = &partialBatch{
+			batch: newBatch(),
 		}
-		ready.add(cb)
+		ba.currentBatches[brokerID] = cb
+	}
+
+	if readyBatch := cb.ready(ba.config); readyBatch != nil {
+		// Batch is ready for transmission - add it to the ready batches, and reset the current batch for this broker.
+		ba.addReadyBatch(brokerID, readyBatch)
 		delete(ba.currentBatches, brokerID)
 	}
+}
+
+func (ba *batchAccumulator) addReadyBatch(brokerID int32, b *batch) {
+	bdq, ok := ba.readyBatches[brokerID]
+	if !ok {
+		bdq = newBatchDeque()
+		ba.readyBatches[brokerID] = bdq
+	}
+	bdq.add(b)
 }
 
 // brokerIDs returns the broker IDs for which the accumulator has ready batches
@@ -603,32 +651,107 @@ func (ba *batchAccumulator) requeue(brokerID int32, b *batch) {
 }
 
 // ================================================================================
+type partialBatch struct {
+	batch     *batch
+	created   time.Time
+	sizeMsgs  int
+	sizeBytes int
+}
+
+// returns true if the future was added to the current batch, or false if adding the future
+// would overflow the current batch - i.e. exceed one of the batches hard limits on size or number of messages.
+func (cb *partialBatch) add(config *Config, f *producerFuture) bool {
+	version := 1
+	if config.Version.IsAtLeast(V0_11_0_0) {
+		version = 2
+	}
+	msgBytes := f.msg.ByteSize(version)
+
+	if cb.sizeMsgs == 0 {
+		cb.created = time.Now()
+		cb.batch = newBatch()                                                  // TODO: check we're not re-initializing this...
+		panicIf(msgBytes > int(MaxRequestSize-(10*1024)), "message too large") // TODO: reject messages that are too large before this point...
+		return true
+	}
+
+	if msgBytes > config.Producer.Flush.Bytes {
+		return false
+	}
+	if config.Producer.Flush.MaxMessages > 0 && cb.sizeMsgs == config.Producer.Flush.MaxMessages {
+		return false
+	}
+
+	cb.batch.add(f)
+	cb.sizeMsgs++
+	cb.sizeBytes += msgBytes
+	return true
+}
+
+// returns the batch, if ready for transmission, or nil if the batch should remain a current
+// batch and have more messages added to it.
+func (cb *partialBatch) ready(config *Config) *batch {
+	if cb.sizeMsgs == 0 {
+		return nil // empty batches can never be ready for transmission
+	}
+	if cb.sizeBytes >= config.Producer.Flush.Bytes {
+		return cb.batch
+	}
+	if cb.sizeBytes >= config.Producer.MaxMessageBytes {
+		return cb.batch
+	}
+	if cb.sizeMsgs >= config.Producer.Flush.MaxMessages {
+		return cb.batch
+	}
+	if cb.created.Add(config.Producer.Flush.Frequency).After(time.Now()) {
+		return cb.batch
+	}
+	return nil
+}
+
+// ================================================================================
 type producerFuture struct {
-	msg     *ProducerMessage
-	retries int
+	msg  *ProducerMessage
+	mu   *sync.Mutex
+	done bool
+	fn   func(msg *ProducerMessage, err error)
 }
 
 func newProducerFuture(msg *ProducerMessage) *producerFuture {
 	return &producerFuture{
 		msg: msg,
+		mu:  &sync.Mutex{},
 	}
 }
 
-func (pf *producerFuture) onCompletion(f func(msg *ProducerMessage, err error)) {
-
+func (pf *producerFuture) onCompletion(fn func(msg *ProducerMessage, err error)) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	panicIf(pf.done, "onCompletion registered for completed future")
+	panicIf(pf.fn != nil, "multiple calls to onCompletion for same future")
+	pf.fn = fn
 }
 
-// TODO: is fail a good method name?
-func (pf *producerFuture) fail(err error) {
-
-}
-
-// TODO: is succeed a good method name?
-func (pf *producerFuture) succeed() {
-
+func (pf *producerFuture) complete(err error) {
+	func() {
+		pf.mu.Lock()
+		defer pf.mu.Unlock()
+		panicIf(pf.done, "duplicate call to complete future")
+		panicIf(pf.done, "no onCompletion callback registered with future")
+		pf.done = true
+	}()
+	pf.fn(pf.msg, err)
 }
 
 // ================================================================================
+
+// deque is a double-ended queue, somewhat inspired by Java's Deque class.
+// The implementation is very basic, and might not make efficient use of the
+// memory backing the slice of elements held by the deque.
+// Trying to perform invalid operations (such as removing an item from the head
+// of an empty deque) will panic (by translating the operation to a invalid operation
+// on the underlying slice). This is a deliberate choice, as typically there will be
+// no obvious recovery action that can be performed if the code finds itself in an
+// inconsistent state.
 type deque[T *Q, Q any] struct {
 	elements []T
 }
@@ -646,22 +769,14 @@ func (d *deque[T, Q]) add(v ...T) {
 }
 
 func (d *deque[T, Q]) addFirst(v ...T) {
-	// TODO: implement me!
+	d.elements = append(v, d.elements...)
 }
 
 func (d *deque[T, Q]) peek() T {
-	if len(d.elements) == 0 {
-		// TODO: should this be an error?
-		return nil
-	}
 	return d.elements[len(d.elements)-1]
 }
 
 func (d *deque[T, Q]) removeFirst() T {
-	if len(d.elements) == 0 {
-		// TODO: should this be an error?
-		return nil
-	}
 	v := d.peek()
 	d.elements = d.elements[:len(d.elements)-1]
 	return v
@@ -682,7 +797,6 @@ func (d *deque[T, Q]) size() int {
 }
 
 func (d *deque[T, Q]) get(idx int) T {
-	// TODO: no bounds check, we just panic.
 	return d.elements[idx]
 }
 
@@ -693,7 +807,7 @@ type futureDeque struct {
 
 func newFutureDeque(f ...*producerFuture) *futureDeque {
 	return &futureDeque{
-		*newDeque[*producerFuture, producerFuture](f...),
+		deque: *newDeque[*producerFuture, producerFuture](f...),
 	}
 }
 
@@ -715,20 +829,20 @@ type batch struct {
 	// topic name -> partition idx -> error
 	topicPartitionErrors map[topicPartition]error // TODO: should this be named 'errors'?
 	hasFailures          bool
-	created              time.Time
-	resolved             bool // TODO: not a good name - means that we've determined the outcome of sending this batch.
+	resolved             bool // TODO: not a good name - when this is set to true it means that we've determined the outcome of sending this batch.
+	firstSequenceNum     map[topicPartition]int64
 }
 
 func newBatch() *batch {
 	return &batch{
 		futures:              nil,
 		topicPartitionErrors: map[topicPartition]error{},
+		firstSequenceNum:     map[topicPartition]int64{},
 	}
 }
 
 func (b *batch) add(future *producerFuture) {
 	if b.futures == nil {
-		b.created = time.Now()
 		b.futures = map[topicPartition]*futureDeque{}
 	}
 	tp := topicPartition{topic: future.msg.Topic, partition: future.msg.Partition}
@@ -756,13 +870,27 @@ func (b *batch) fail(topic string, partition int32, err KError) {
 // from the futures map, leaving only topic partitions that have errors associated with them.
 func (b *batch) processSuccesses() {
 	for tp, fdq := range b.futures {
-		if b.topicPartitionErrors[tp] == nil {
-			for !fdq.isEmpty() {
-				f := fdq.removeFirst()
-				f.succeed()
-			}
+		if b.topicPartitionErrors[tp] != nil {
+			continue
+		}
+		for !fdq.isEmpty() {
+			f := fdq.removeFirst()
+			f.complete(nil)
 		}
 		delete(b.futures, tp)
+	}
+}
+
+func (b *batch) updateLastSuccessfulSequenceNumber(lastSuccessfulSeqNum map[topicPartition]int64) {
+	for tp, fdq := range b.futures {
+		if b.topicPartitionErrors[tp] != nil {
+			continue
+		}
+		lastSuccess := b.firstSequenceNum[tp] + int64(fdq.size())
+		v, ok := lastSuccessfulSeqNum[tp]
+		if !ok || lastSuccess > v {
+			lastSuccessfulSeqNum[tp] = lastSuccess
+		}
 	}
 }
 
@@ -776,7 +904,7 @@ func (b *batch) processFailures(tp topicPartition) {
 
 	for !fdq.isEmpty() {
 		f := fdq.removeFirst()
-		f.fail(err)
+		f.complete(err)
 	}
 	delete(b.futures, tp)
 }
@@ -798,13 +926,108 @@ func (b *batch) isEmpty() bool {
 	return len(b.futures) == 0
 }
 
-func (b *batch) isFull() bool {
-	// TODO: write this code...
-	return false
+func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map[topicPartition]int64) *ProduceRequest {
+	// TODO: for the moment, we only care about building the version 2 batch format.
+	pr := &ProduceRequest{
+		RequiredAcks: config.Producer.RequiredAcks,
+		Timeout:      int32(config.Producer.Timeout / time.Millisecond),
+		records:      map[string]map[int32]Records{},
+	}
+	switch {
+	case config.Version.IsAtLeast(V2_1_0_0):
+		pr.Version = 7
+	case config.Version.IsAtLeast(V2_0_0_0):
+		pr.Version = 6
+	case config.Version.IsAtLeast(V1_0_0_0):
+		pr.Version = 5
+	case config.Version.IsAtLeast(V0_11_0_0):
+		pr.Version = 3
+	case config.Version.IsAtLeast(V0_10_0_0):
+		pr.Version = 2
+	}
+	// TODO: if version IsAtLeast(V0_11_0_0) - need to consider setting the transaction ID
+
+	// pr contains records = map[string]map[int32]Records
+	// Records contains a records batch (of type RecordBatch
+	// RecordBatch contains an array of []Record
+	for tp, fdq := range b.futures {
+		panicIf(fdq.size() == 0, "encountered empty future queue for topic/partition")
+		recordSlice := make([]*Record, fdq.size())
+		for i := 0; i < fdq.size(); i++ {
+			f := fdq.get(i)
+			recordSlice[i] = recordFor(i == 0, f.msg)
+		}
+		rb := &RecordBatch{
+			Version:              2,
+			PartitionLeaderEpoch: 0, // TODO: this is never used by Sarama (but the broker expects it)...
+			ProducerEpoch:        producerEpoch,
+			Codec:                config.Producer.Compression,
+			CompressionLevel:     config.Producer.CompressionLevel,
+			// TODO: presumably there are other important fields in here...
+			Records: recordSlice,
+			// FirstOffset is set below...
+		}
+		if config.Producer.Idempotent {
+			rb.FirstOffset = sequence[tp]
+			sequence[tp] += int64(len(rb.Records))
+		}
+		records := newDefaultRecords(rb)
+		partitionToRecords, ok := pr.records[tp.topic]
+		if !ok {
+			partitionToRecords = map[int32]Records{}
+			pr.records[tp.topic] = partitionToRecords
+		}
+		partitionToRecords[tp.partition] = records
+	}
+
+	return nil // TODO: write the code for this.
 }
 
-func (b *batch) produceRequest() *ProduceRequest {
-	return nil // TODO: write the code for this.
+func recordFor(isFirst bool, msg *ProducerMessage) *Record {
+	size := 0 // TODO: size is used to provide a more accurate "is this batch big enough?" check, and also when dropping partitions from a set
+	if isFirst {
+		size += recordBatchOverhead
+	}
+
+	var err error
+	var key, val []byte
+
+	// TODO: given that these can fail - it would make sense to do this much earlier in the
+	// async producer. Maybe the future type should encapsulate a Record rather than a ProducerMessage?
+	if msg.Key != nil {
+		key, err = msg.Key.Encode()
+		panicIf(err != nil, "couldn't encode key")
+	}
+	if msg.Value != nil {
+		val, err = msg.Value.Encode()
+		panicIf(err != nil, "couldn't encode value")
+	}
+
+	size += maximumRecordOverhead
+	record := &Record{
+		Key:            key,
+		Value:          val,
+		TimestampDelta: 0, // TODO: timestamp.Sub(set.recordsToSend.RecordBatch.FirstTimestamp),
+		OffsetDelta:    0, // TODO: need to work out how to set this...
+		// Headers set below
+		// TODO: do Attributes need to be set?
+	}
+	if len(msg.Headers) > 0 {
+		record.Headers = make([]*RecordHeader, len(msg.Headers))
+		for i := range msg.Headers {
+			record.Headers[i] = &msg.Headers[i]
+			size += len(record.Headers[i].Key) + len(record.Headers[i].Value) + 2*binary.MaxVarintLen32
+		}
+	}
+	return record
+}
+
+func (b *batch) topicPartitions() []topicPartition { // TODO: this doesn't seem like a good interface to provide...
+	result := []topicPartition{}
+	for tp := range b.futures {
+		result = append(result, tp)
+	}
+	return result
 }
 
 // ================================================================================
