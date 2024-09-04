@@ -54,8 +54,8 @@ type asyncProducer2 struct {
 	drainInflight        bool
 	batchTicker          *time.Ticker
 	batchTickerRunning   bool
-	lastSuccessfulSeqNum map[topicPartition]int64
-	nextSequenceNum      map[topicPartition]int64
+	lastSuccessfulSeqNum map[topicPartition]int32
+	nextSequenceNum      map[topicPartition]int32
 }
 
 type inflightInfo struct {
@@ -89,8 +89,8 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		drainInflight:        false,
 		batchTicker:          time.NewTicker(100 * time.Millisecond), // TODO: set this from config
 		batchTickerRunning:   false,
-		lastSuccessfulSeqNum: map[topicPartition]int64{},
-		nextSequenceNum:      map[topicPartition]int64{},
+		lastSuccessfulSeqNum: map[topicPartition]int32{},
+		nextSequenceNum:      map[topicPartition]int32{},
 	}
 	p.batchTicker.Stop()
 
@@ -172,6 +172,7 @@ func (ap *asyncProducer2) processAwaitingPartitioning() bool {
 		for !pq.isEmpty() {
 			f := pq.peek()
 			if err := ap.partitionMessage(f.msg); err != nil {
+				DebugLogger.Println("processAwaitingPartitioning: need metadata")
 				needMetadataRefresh = true
 				break
 			}
@@ -185,6 +186,7 @@ func (ap *asyncProducer2) processAwaitingPartitioning() bool {
 		}
 	}
 
+	//DebugLogger.Printf("processAwaitingPartitioning, result: %t", needMetadataRefresh)
 	return needMetadataRefresh
 }
 
@@ -196,6 +198,7 @@ func (ap *asyncProducer2) processAwaitingLeader() bool {
 			f := lq.peek()
 			broker, leaderEpoch, err := ap.client.LeaderAndEpoch(f.msg.Topic, f.msg.Partition)
 			if err != nil {
+				DebugLogger.Printf("processAwaitingLeader: need metadata refresh")
 				needMetadataRefresh = true
 				break
 			}
@@ -209,47 +212,79 @@ func (ap *asyncProducer2) processAwaitingLeader() bool {
 }
 
 func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
+	fmt.Printf("sending batch %p to broker %d\n", b, brokerID)
 	broker, err := ap.client.Broker(brokerID)
 	if err != nil {
 		// Handle all outcomes in the same way: another goroutine invoking asyncProducerCallback.
-		go ap.asyncProduceCallback(b, nil, err)
+		time.Sleep(1 * time.Second) // TODO: need a better fix - like muting the broker after we close it..
+		go ap.asyncProduceCallback(brokerID, b, nil, err)
+		return
 	}
 
 	request := b.produceRequest(ap.config, ap.producerEpoch, ap.nextSequenceNum)
 	err = broker.AsyncProduce(request, func(resp *ProduceResponse, err error) {
-		ap.asyncProduceCallback(b, resp, err)
+		ap.asyncProduceCallback(brokerID, b, resp, err)
 	})
 	if err != nil || request.RequiredAcks == NoResponse {
 		// AsyncProduce doesn't invoke the callback for acks=0 so make sure asyncProduceCallback
 		// is notified that the produce has been attempted.
-		go ap.asyncProduceCallback(b, nil, err)
+		go ap.asyncProduceCallback(brokerID, b, nil, err)
+		return
 	}
 }
 
 // asyncProduceCallback is called in response to producing a message using the Broker.AsyncProduce(...) method.
 // As this method is used across a number of Brokers, it can be called concurrently on multiple goroutines.
 // The response argument can be nil if the produce request was with acks=0
-func (ap *asyncProducer2) asyncProduceCallback(batch *batch, response *ProduceResponse, err error) {
-	ap.produceCompleted <- &asyncProduceResult{
-		batch:    batch,
-		response: response,
-		err:      err,
+func (ap *asyncProducer2) asyncProduceCallback(brokerID int32, batch *batch, response *ProduceResponse, err error) {
+	fmt.Printf("asyncProduceCallback %v(%p) %v %v\n", batch, batch, response, err)
+
+	if err != nil {
+		// If the broker needs to be closed, then launch this in a separate go-routine that also delivers the result
+		// once the close has completed. This is necessary to avoid a couple of potential deadlock situations:
+		// 1. Closing the broker on this go-routine deadlocks because close waits until this callback completes (which
+		//    of course it cannot do, because it is blocked on Close())
+		// 2. Calling close in the go-routine running dispatchInput (TODO: do we rename this?) also deadlocks because
+		//    it cannot drain the produceCompleted channel if it is blocked in Close() and close cannot complete because
+		//    it cannot add anything into the produceCompleted channel (as the go-routine in despatchInput is blocked)
+		// TODO: would the Close code be cleaner if it was moved into sendToBroker()?
+		go func() {
+			fmt.Println("closing broker")
+			b, berr := ap.client.Broker(brokerID)
+			if berr == nil {
+				b.Close()
+			}
+
+			ap.produceCompleted <- &asyncProduceResult{
+				brokerID: brokerID,
+				batch:    batch,
+				response: response,
+				err:      err,
+			}
+		}()
+	} else {
+		ap.produceCompleted <- &asyncProduceResult{
+			brokerID: brokerID,
+			batch:    batch,
+			response: response,
+			err:      err,
+		}
 	}
 }
 
 type asyncProduceResult struct {
+	brokerID int32
 	batch    *batch
 	response *ProduceResponse
 	err      error
 }
-
-const maxInflight = 5 // TODO: get this from configuration
 
 func (ap *asyncProducer2) maybeProduceBatches() {
 	// Try to assign partitions to any futures awaiting partitioning, and find leaders for any awaiting a leader
 	updateMetadata := ap.processAwaitingPartitioning()
 	updateMetadata = updateMetadata || ap.processAwaitingLeader()
 	if updateMetadata {
+		fmt.Println("require metadata update")
 		// If some futures couldn't be partitioned or don't have a leader, trigger a metadata refresh.
 		ap.refreshMetadata <- "x" // TODO: wrong type for channel? Or wrong return type from processX functions?
 	}
@@ -266,6 +301,7 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 	// If the in-flight messages are being drained, then there is nothing left to do.
 	// Transitioning out of draining will occur when notified that the last of the batches has been processed
 	if ap.drainInflight {
+		fmt.Println("drainInflight")
 		return
 	}
 
@@ -279,7 +315,8 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 			}
 			ap.inflight[brokerID] = inflightForBroker
 		}
-		for inflightForBroker.batches.size() <= maxInflight {
+		fmt.Printf("inflights: %d %d\n", inflightForBroker.batches.size(), ap.config.Net.MaxOpenRequests)
+		for inflightForBroker.batches.size() < ap.config.Net.MaxOpenRequests {
 			b := ap.accumulator.poll(brokerID)
 			if b == nil {
 				break
@@ -296,7 +333,7 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 func updateInflightStatus(produceResult *asyncProduceResult) {
 	panicIf(produceResult.batch.resolved, "batch has already been resolved")
 	produceResult.batch.resolved = true
-
+	fmt.Printf("updateInflightStatus batch %p marked resolved\n", produceResult.batch)
 	// Response has a top-level error - fail all topic/partitions using this.
 	if produceResult.err != nil {
 		produceResult.batch.failAll(produceResult.err)
@@ -321,6 +358,7 @@ func updateInflightStatus(produceResult *asyncProduceResult) {
 // TODO: in general this method is a bit sprawling, and the logic is somewhat haphazardly split
 // across int the completeFailedBatches method.
 func (ap *asyncProducer2) completeInFlightBatches() {
+	fmt.Println("completeInFlightBatches called")
 	for brokerID, brokerInFlight := range ap.inflight {
 		// Start at the oldest in-flight batch, skipping any muted brokers:
 		// - Remove resolved batches if they were successful
@@ -328,6 +366,7 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 		// - Stop if an unresolved batch is encountered
 		for !brokerInFlight.batches.isEmpty() && !brokerInFlight.muted {
 			headBatch := brokerInFlight.batches.peek()
+			fmt.Printf("completeInFlightBatches headBatch(%p).resolved=%t\n", headBatch, headBatch.resolved)
 			if headBatch.resolved {
 				if headBatch.hasFailures {
 					brokerInFlight.muted = true
@@ -335,6 +374,7 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 				} else {
 					headBatch.updateLastSuccessfulSequenceNumber(ap.lastSuccessfulSeqNum)
 					headBatch.processSuccesses()
+					fmt.Println("completeInFlightBatches removeFirst called")
 					brokerInFlight.batches.removeFirst()
 				}
 			} else {
@@ -427,6 +467,7 @@ func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *deque[
 		batch := inflight.get(idx)
 		if len(batch.futures) > 0 {
 			batch.resetErrors()
+			batch.resolved = false // TODO: this should be done in a more general "reset" method (e.g. re-purpose batch.resetErrors())
 			ap.accumulator.requeue(brokerID, batch)
 		}
 	}
@@ -456,7 +497,13 @@ func isRetryable(isFirstFailingInflight bool, err error) bool {
 func (ap *asyncProducer2) dispatchInput() {
 	for {
 		select {
-		case msg := <-ap.input:
+		case msg, ok := <-ap.input:
+			DebugLogger.Println("read from input")
+			if !ok {
+				// TODO: this is probably not the right code path for being closed...
+				DebugLogger.Println("closed")
+				return
+			}
 			// a new message has been passed to the async producer via its input channel
 			// create a future for it
 			f := ap.wrapIntoFuture(msg)
@@ -469,14 +516,19 @@ func (ap *asyncProducer2) dispatchInput() {
 			}
 
 		case <-ap.metadataRefreshed:
+			DebugLogger.Println("metadata refresh")
 			// metadata has been refreshed - see if this allows for more batches to be ready
 			// to produce
 
 		case <-ap.batchTicker.C:
+			DebugLogger.Println("batch ticker")
+
 			// deadline for time based batch completion has been reached - see if this has
 			// caused more batches to become ready to produce.
 
 		case produceResult := <-ap.produceCompleted:
+			DebugLogger.Println("produce completed")
+
 			updateInflightStatus(produceResult)
 			ap.completeInFlightBatches()
 		}
@@ -630,6 +682,7 @@ func (ba *batchAccumulator) brokerIDs() []int32 {
 func (ba *batchAccumulator) poll(brokerID int32) *batch {
 	ready, ok := ba.readyBatches[brokerID]
 	if !ok || ready.isEmpty() {
+		DebugLogger.Println("batchAccumulator: poll returned nil")
 		return nil
 	}
 	return ready.removeFirst()
@@ -667,18 +720,29 @@ func (cb *partialBatch) add(config *Config, f *producerFuture) bool {
 	}
 	msgBytes := f.msg.ByteSize(version)
 
+	isFirst := false
 	if cb.sizeMsgs == 0 {
+		isFirst = true
 		cb.created = time.Now()
 		cb.batch = newBatch()                                                  // TODO: check we're not re-initializing this...
 		panicIf(msgBytes > int(MaxRequestSize-(10*1024)), "message too large") // TODO: reject messages that are too large before this point...
-		return true
 	}
 
-	if msgBytes > config.Producer.Flush.Bytes {
-		return false
-	}
-	if config.Producer.Flush.MaxMessages > 0 && cb.sizeMsgs == config.Producer.Flush.MaxMessages {
-		return false
+	// TODO: these tests don't seem to include the current size of the partial batch. That should be added to msgBytes??
+
+	if !isFirst {
+		// TODO: do these tests need to include a condition for approaching maximum message size?
+
+		if config.Producer.Flush.Bytes > 0 && msgBytes > config.Producer.Flush.Bytes {
+			return false
+		}
+		if config.Producer.Flush.MaxMessages > 0 && cb.sizeMsgs == config.Producer.Flush.MaxMessages {
+			return false
+		}
+		if time.Now().After(cb.created.Add(config.Producer.Flush.Frequency)) {
+			// TODO: might be better to store a deadline in the batch, rather than re-calculate it each time
+			return false
+		}
 	}
 
 	cb.batch.add(f)
@@ -773,12 +837,12 @@ func (d *deque[T, Q]) addFirst(v ...T) {
 }
 
 func (d *deque[T, Q]) peek() T {
-	return d.elements[len(d.elements)-1]
+	return d.elements[0]
 }
 
 func (d *deque[T, Q]) removeFirst() T {
 	v := d.peek()
-	d.elements = d.elements[:len(d.elements)-1]
+	d.elements = d.elements[1:]
 	return v
 }
 
@@ -830,14 +894,14 @@ type batch struct {
 	topicPartitionErrors map[topicPartition]error // TODO: should this be named 'errors'?
 	hasFailures          bool
 	resolved             bool // TODO: not a good name - when this is set to true it means that we've determined the outcome of sending this batch.
-	firstSequenceNum     map[topicPartition]int64
+	firstSequenceNum     map[topicPartition]int32
 }
 
 func newBatch() *batch {
 	return &batch{
 		futures:              nil,
 		topicPartitionErrors: map[topicPartition]error{},
-		firstSequenceNum:     map[topicPartition]int64{},
+		firstSequenceNum:     map[topicPartition]int32{},
 	}
 }
 
@@ -881,12 +945,14 @@ func (b *batch) processSuccesses() {
 	}
 }
 
-func (b *batch) updateLastSuccessfulSequenceNumber(lastSuccessfulSeqNum map[topicPartition]int64) {
+func (b *batch) updateLastSuccessfulSequenceNumber(lastSuccessfulSeqNum map[topicPartition]int32) {
 	for tp, fdq := range b.futures {
 		if b.topicPartitionErrors[tp] != nil {
 			continue
 		}
-		lastSuccess := b.firstSequenceNum[tp] + int64(fdq.size())
+		lastSuccess := (b.firstSequenceNum[tp] + int32(fdq.size())) - 1 // TODO: -1 feels like a hack!
+		fmt.Printf("update last successful sequence number: %v %v %d\n", tp, lastSuccessfulSeqNum[tp], lastSuccess)
+
 		v, ok := lastSuccessfulSeqNum[tp]
 		if !ok || lastSuccess > v {
 			lastSuccessfulSeqNum[tp] = lastSuccess
@@ -907,6 +973,7 @@ func (b *batch) processFailures(tp topicPartition) {
 		f.complete(err)
 	}
 	delete(b.futures, tp)
+	delete(b.topicPartitionErrors, tp)
 }
 
 func (b *batch) resetErrors() {
@@ -926,7 +993,7 @@ func (b *batch) isEmpty() bool {
 	return len(b.futures) == 0
 }
 
-func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map[topicPartition]int64) *ProduceRequest {
+func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map[topicPartition]int32) *ProduceRequest {
 	// TODO: for the moment, we only care about building the version 2 batch format.
 	pr := &ProduceRequest{
 		RequiredAcks: config.Producer.RequiredAcks,
@@ -965,11 +1032,12 @@ func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map
 			CompressionLevel:     config.Producer.CompressionLevel,
 			// TODO: presumably there are other important fields in here...
 			Records: recordSlice,
-			// FirstOffset is set below...
+			// FirstOffset - apparently this always needs to be zero??
+			// FirstSequence - set below.
 		}
 		if config.Producer.Idempotent {
-			rb.FirstOffset = sequence[tp]
-			sequence[tp] += int64(len(rb.Records))
+			rb.FirstSequence = sequence[tp]
+			sequence[tp] += int32(len(rb.Records))
 		}
 		records := newDefaultRecords(rb)
 		partitionToRecords, ok := pr.records[tp.topic]
@@ -980,7 +1048,7 @@ func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map
 		partitionToRecords[tp.partition] = records
 	}
 
-	return nil // TODO: write the code for this.
+	return pr
 }
 
 func recordFor(isFirst bool, msg *ProducerMessage) *Record {
