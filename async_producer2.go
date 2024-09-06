@@ -1,6 +1,7 @@
 package sarama
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -45,10 +46,10 @@ type asyncProducer2 struct {
 	producerID    int64
 	producerEpoch int16
 
-	// TODO: the following are only touched by the goroutine running dispatchInput()
+	// TODO: the following are only touched by the goroutine running eventLoop()
 	// TODO: split out into another struct
-	awaitingPartitioning map[string]*deque[*producerFuture, producerFuture]
-	awaitingLeader       map[string]*deque[*producerFuture, producerFuture]
+	awaitingPartitioning map[string]*futureDeque
+	awaitingLeader       map[topicPartition]*futureDeque
 	accumulator          *batchAccumulator
 	inflight             map[int32]*inflightInfo
 	drainInflight        bool
@@ -56,11 +57,15 @@ type asyncProducer2 struct {
 	batchTickerRunning   bool
 	lastSuccessfulSeqNum map[topicPartition]int32
 	nextSequenceNum      map[topicPartition]int32
+	unMuteTimer          *timer[int] // TODO: does this even need a type?
+	mutedTopics          *mutedSet[string]
+	mutedTopicPartitions *mutedSet[topicPartition]
+	mutedBrokers         *mutedSet[int32]
 }
 
 type inflightInfo struct {
 	muted   bool
-	batches *deque[*batch, batch]
+	batches *batchDeque
 }
 
 func newAsyncProducer2(client Client) (AsyncProducer, error) {
@@ -69,6 +74,7 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 	}
 	config := client.Config()
 
+	unMuteTimer := newTimer[int]()
 	p := &asyncProducer2{
 		config:            config,
 		client:            client,
@@ -82,8 +88,8 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 
 		producerID: noProducerID,
 
-		awaitingPartitioning: map[string]*deque[*producerFuture, producerFuture]{},
-		awaitingLeader:       map[string]*deque[*producerFuture, producerFuture]{},
+		awaitingPartitioning: map[string]*futureDeque{},
+		awaitingLeader:       map[topicPartition]*futureDeque{},
 		accumulator:          netBatchAccumulator(config),
 		inflight:             map[int32]*inflightInfo{},
 		drainInflight:        false,
@@ -91,6 +97,10 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		batchTickerRunning:   false,
 		lastSuccessfulSeqNum: map[topicPartition]int32{},
 		nextSequenceNum:      map[topicPartition]int32{},
+		unMuteTimer:          unMuteTimer,
+		mutedTopics:          newMutedSet[string](unMuteTimer),
+		mutedTopicPartitions: newMutedSet[topicPartition](unMuteTimer),
+		mutedBrokers:         newMutedSet[int32](unMuteTimer),
 	}
 	p.batchTicker.Stop()
 
@@ -111,7 +121,7 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		p.producerEpoch = resp.ProducerEpoch
 	}
 
-	go p.dispatchInput()
+	go p.eventLoop()
 	return p, nil
 }
 
@@ -165,41 +175,53 @@ func (ap *asyncProducer2) wrapIntoFuture(msg *ProducerMessage) *producerFuture {
 	return f
 }
 
+// TODO: this is a place-holder until a proper retry time calculation is implemented.
+const retryDuration = 5 * time.Second
+
 // TODO: currently there's no escape from this if a message persistently can't be partitioned
-func (ap *asyncProducer2) processAwaitingPartitioning() bool {
-	needMetadataRefresh := false
-	for _, pq := range ap.awaitingPartitioning {
+func (ap *asyncProducer2) processAwaitingPartitioning() {
+	for topic, pq := range ap.awaitingPartitioning {
+		if ap.mutedTopics.contains(topic) {
+			continue // skip muted topics
+		}
+
 		for !pq.isEmpty() {
 			f := pq.peek()
-			if err := ap.partitionMessage(f.msg); err != nil {
-				DebugLogger.Println("processAwaitingPartitioning: need metadata")
-				needMetadataRefresh = true
+			retry, err := ap.partitionMessage(f.msg)
+			if err != nil && retry {
+				ap.mutedTopics.add(topic, retryDuration)
 				break
 			}
+
 			pq.removeFirst()
 
-			if lq, ok := ap.awaitingLeader[f.msg.Topic]; !ok {
-				ap.awaitingLeader[f.msg.Topic] = newDeque[*producerFuture, producerFuture](f)
+			if err != nil && !retry {
+				f.complete(err) // Fail the message
+				continue
+			}
+
+			tp := topicPartition{f.msg.Topic, f.msg.Partition}
+			if lq, ok := ap.awaitingLeader[tp]; !ok {
+				ap.awaitingLeader[tp] = newFutureDeque(f)
 			} else {
 				lq.add(f)
 			}
 		}
 	}
-
-	//DebugLogger.Printf("processAwaitingPartitioning, result: %t", needMetadataRefresh)
-	return needMetadataRefresh
 }
 
 // TODO: currently there's no escape from this if a message persistently can't find a leader
-func (ap *asyncProducer2) processAwaitingLeader() bool {
-	needMetadataRefresh := false
-	for _, lq := range ap.awaitingLeader {
+func (ap *asyncProducer2) processAwaitingLeader() {
+	for tp, lq := range ap.awaitingLeader {
+		if ap.mutedTopicPartitions.contains(tp) {
+			continue
+		}
+
 		for !lq.isEmpty() {
 			f := lq.peek()
 			broker, leaderEpoch, err := ap.client.LeaderAndEpoch(f.msg.Topic, f.msg.Partition)
 			if err != nil {
-				DebugLogger.Printf("processAwaitingLeader: need metadata refresh")
-				needMetadataRefresh = true
+				ap.mutedTopicPartitions.add(tp, retryDuration)
 				break
 			}
 			lq.removeFirst()
@@ -207,8 +229,6 @@ func (ap *asyncProducer2) processAwaitingLeader() bool {
 			ap.accumulator.add(f, broker.ID(), leaderEpoch)
 		}
 	}
-
-	return needMetadataRefresh
 }
 
 func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
@@ -216,7 +236,13 @@ func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
 	broker, err := ap.client.Broker(brokerID)
 	if err != nil {
 		// Handle all outcomes in the same way: another goroutine invoking asyncProducerCallback.
-		time.Sleep(1 * time.Second) // TODO: need a better fix - like muting the broker after we close it..
+		if !ap.mutedBrokers.contains(brokerID) {
+			// Guard against broker already been muted, as in the case of multiple inflight batches,
+			// it's possible for one batch to fail and mute the broker, and then a second to fail and
+			// also try to mute the broker
+			// TODO: this avoids the panic, but is it the desired behavior?
+			ap.mutedBrokers.add(brokerID, retryDuration)
+		}
 		go ap.asyncProduceCallback(brokerID, b, nil, err)
 		return
 	}
@@ -244,12 +270,17 @@ func (ap *asyncProducer2) asyncProduceCallback(brokerID int32, batch *batch, res
 		// once the close has completed. This is necessary to avoid a couple of potential deadlock situations:
 		// 1. Closing the broker on this go-routine deadlocks because close waits until this callback completes (which
 		//    of course it cannot do, because it is blocked on Close())
-		// 2. Calling close in the go-routine running dispatchInput (TODO: do we rename this?) also deadlocks because
+		// 2. Calling close in the go-routine running eventLoop() also deadlocks because
 		//    it cannot drain the produceCompleted channel if it is blocked in Close() and close cannot complete because
 		//    it cannot add anything into the produceCompleted channel (as the go-routine in despatchInput is blocked)
 		// TODO: would the Close code be cleaner if it was moved into sendToBroker()?
 		go func() {
 			fmt.Println("closing broker")
+			if !ap.mutedBrokers.contains(brokerID) {
+				// TODO: explain why this guard is necessary...
+				ap.mutedBrokers.add(brokerID, retryDuration)
+			}
+
 			b, berr := ap.client.Broker(brokerID)
 			if berr == nil {
 				b.Close()
@@ -281,13 +312,8 @@ type asyncProduceResult struct {
 
 func (ap *asyncProducer2) maybeProduceBatches() {
 	// Try to assign partitions to any futures awaiting partitioning, and find leaders for any awaiting a leader
-	updateMetadata := ap.processAwaitingPartitioning()
-	updateMetadata = updateMetadata || ap.processAwaitingLeader()
-	if updateMetadata {
-		fmt.Println("require metadata update")
-		// If some futures couldn't be partitioned or don't have a leader, trigger a metadata refresh.
-		ap.refreshMetadata <- "x" // TODO: wrong type for channel? Or wrong return type from processX functions?
-	}
+	ap.processAwaitingPartitioning()
+	ap.processAwaitingLeader()
 
 	// TODO: tickers will panic if passed a zero duration - is that ever a valid configuration for Sarama?
 	if ap.accumulator.hasIncompleteBatches() && !ap.batchTickerRunning {
@@ -307,10 +333,14 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 
 	// See if there is capacity to move accumulated batches into inflight.
 	for _, brokerID := range ap.accumulator.brokerIDs() {
+		if ap.mutedBrokers.contains(brokerID) {
+			continue
+		}
+
 		inflightForBroker, ok := ap.inflight[brokerID]
 		if !ok {
 			inflightForBroker = &inflightInfo{
-				batches: newDeque[*batch, batch](),
+				batches: newBatchDeque(),
 				muted:   false,
 			}
 			ap.inflight[brokerID] = inflightForBroker
@@ -420,7 +450,7 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 
 		// Retry any retry-able batches, empty out the in-flights
 		ap.completeFailedBatches(brokerID, brokerInFlight.batches)
-		brokerInFlight.batches = newDeque[*batch, batch]()
+		brokerInFlight.batches = newBatchDeque()
 		brokerInFlight.muted = false // TODO: should the un-mute be done based on a timer?
 
 		// Reset sequence numbers to one beyond the last successful batch's last sequence number
@@ -440,7 +470,7 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 	}
 }
 
-func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *deque[*batch, batch]) {
+func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *batchDeque) {
 	panicIf(inflight.isEmpty(), "assertion failed: inflight should not be empty")
 	panicIf(!inflight.peek().hasFailures, "assertion failed: first inflight should have been marked as failing")
 
@@ -493,8 +523,8 @@ func isRetryable(isFirstFailingInflight bool, err error) bool {
 		errors.Is(kerr, ErrNotEnoughReplicasAfterAppend)
 }
 
-// dispatchInput...
-func (ap *asyncProducer2) dispatchInput() {
+// eventLoop...
+func (ap *asyncProducer2) eventLoop() {
 	for {
 		select {
 		case msg, ok := <-ap.input:
@@ -510,7 +540,7 @@ func (ap *asyncProducer2) dispatchInput() {
 
 			// Add the future to those awaiting partitioning
 			if pq, ok := ap.awaitingPartitioning[msg.Topic]; !ok {
-				ap.awaitingPartitioning[msg.Topic] = newDeque[*producerFuture, producerFuture](f)
+				ap.awaitingPartitioning[msg.Topic] = newFutureDeque(f)
 			} else {
 				pq.add(f)
 			}
@@ -519,6 +549,10 @@ func (ap *asyncProducer2) dispatchInput() {
 			DebugLogger.Println("metadata refresh")
 			// metadata has been refreshed - see if this allows for more batches to be ready
 			// to produce
+
+		case <-ap.unMuteTimer.eventChannel():
+			DebugLogger.Println("un-mute timer")
+			// TODO: presumably we can just drop through for this?
 
 		case <-ap.batchTicker.C:
 			DebugLogger.Println("batch ticker")
@@ -537,7 +571,11 @@ func (ap *asyncProducer2) dispatchInput() {
 	}
 }
 
-func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) error {
+// partitionMessage attempts to determine which partition of a topic the message
+// should be sent to, and if successful updates the partition field of the message.
+// If unsuccessful, in addition to returning an error, the boolean result is set to
+// true if the operation is retry-able.
+func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) (bool, error) {
 	partitioner := ap.config.Producer.Partitioner(msg.Topic) // TODO: building this on each call is inefficient...
 	var partitions []int32
 
@@ -555,25 +593,24 @@ func (ap *asyncProducer2) partitionMessage(msg *ProducerMessage) error {
 		partitions, err = ap.client.WritablePartitions(msg.Topic)
 	}
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	numPartitions := int32(len(partitions))
 	if numPartitions == 0 {
-		return ErrLeaderNotAvailable
+		return true, ErrLeaderNotAvailable
 	}
 
 	choice, err := partitioner.Partition(msg, numPartitions)
-
 	if err != nil {
-		return err
+		return true, err // retry-able, as the partitioner is plug-able so unclear if this can be transitory
 	} else if choice < 0 || choice >= numPartitions {
-		return ErrInvalidPartition // TODO: some of these errors should be hard failures for the message.
+		return false, ErrInvalidPartition // not retry-able as partitioner result was not valid
 	}
 
 	msg.Partition = partitions[choice]
 
-	return nil
+	return false, nil
 }
 
 // ================================================================================
@@ -1096,6 +1133,132 @@ func (b *batch) topicPartitions() []topicPartition { // TODO: this doesn't seem 
 		result = append(result, tp)
 	}
 	return result
+}
+
+// ================================================================================
+type (
+	timer[T any] struct {
+		in           chan timerEvent[T]
+		out          chan T
+		pending      *eventHeap[T]
+		timer        *time.Timer
+		nextDeadline *time.Time
+	}
+
+	timerEvent[T any] struct {
+		event T
+		time  time.Time
+	}
+
+	eventHeap[T any] []timerEvent[T]
+)
+
+func (eh eventHeap[T]) Len() int           { return len(eh) }
+func (eh eventHeap[T]) Less(i, j int) bool { return eh[i].time.Before(eh[j].time) }
+func (eh eventHeap[T]) Swap(i, j int)      { eh[i], eh[j] = eh[j], eh[i] }
+func (eh *eventHeap[T]) Push(x any)        { *eh = append(*eh, x.(timerEvent[T])) }
+func (eh *eventHeap[T]) Pop() any {
+	old := *eh
+	n := len(old)
+	x := old[n-1]
+	*eh = old[0 : n-1]
+	return x
+}
+
+func newTimer[T any]() *timer[T] {
+	t := &timer[T]{
+		in:      make(chan timerEvent[T]),
+		out:     make(chan T),
+		pending: &eventHeap[T]{},
+		timer:   time.NewTimer(time.Hour),
+	}
+	heap.Init(t.pending)
+	t.timer.Stop()
+	go t.run()
+	return t
+}
+
+func (t *timer[T]) notifyIn(d time.Duration, event T) {
+	t.in <- timerEvent[T]{
+		event: event,
+		time:  time.Now().Add(d),
+	}
+}
+
+func (t *timer[T]) run() {
+	select {
+	case te, ok := <-t.in: // notifyIn called to add a new timer
+		if !ok { // closed
+			t.timer.Stop()
+			return
+		}
+		heap.Push(t.pending, te)
+		if t.nextDeadline == nil || te.time.Before(*t.nextDeadline) {
+			// the new timer is the only timer / fires before any other timer
+			t.nextDeadline = &te.time
+			d := time.Until(te.time)
+			if d < 1 {
+				d = 1
+			}
+			t.timer.Stop()
+			t.timer.Reset(d)
+		}
+
+	case <-t.timer.C: // a timer has fired
+		t.nextDeadline = nil
+		now := time.Now()
+		for t.pending.Len() > 0 {
+			te := heap.Pop(t.pending).(timerEvent[T])
+			if te.time.Before(now) {
+				t.out <- te.event
+			} else {
+				t.nextDeadline = &te.time
+				heap.Push(t.pending, te)
+				t.timer.Reset(te.time.Sub(now))
+				break
+			}
+		}
+	}
+}
+
+func (t *timer[T]) close() {
+	close(t.in)
+}
+
+func (t *timer[T]) eventChannel() <-chan T {
+	return t.out
+}
+
+// ================================================================================
+type mutedSet[T comparable] struct {
+	muted map[T]time.Time
+	timer *timer[int]
+}
+
+func newMutedSet[T comparable](timer *timer[int]) *mutedSet[T] {
+	return &mutedSet[T]{
+		muted: map[T]time.Time{},
+		timer: timer,
+	}
+}
+
+func (ms *mutedSet[T]) contains(v T) bool {
+	t, ok := ms.muted[v]
+	if !ok {
+		return false
+	}
+	if t.Before(time.Now()) {
+		delete(ms.muted, v)
+		return false
+	}
+	return true
+}
+
+func (ms *mutedSet[T]) add(v T, d time.Duration) {
+	panicIf(ms.contains(v), "mutedSet already contains %v", v)
+	fmt.Printf("muting %v for %d\n", v, d)
+	ms.muted[v] = time.Now().Add(d)
+	ms.timer.notifyIn(d, 0)
 }
 
 // ================================================================================
