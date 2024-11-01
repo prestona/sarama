@@ -197,6 +197,10 @@ type ProducerMessage struct {
 	sequenceNumber int32
 	producerEpoch  int16
 	hasSequence    bool
+
+	// TODO: the following are used by async_producer2.go
+	flags2   txFlags
+	txResult chan error
 }
 
 const producerMessageOverhead = 26 // the metadata overhead of CRC, flags, etc.

@@ -9,15 +9,6 @@ import (
 	"time"
 )
 
-// TODO: random collection of things
-// - https://issues.apache.org/jira/browse/KAFKA-5494 - allowed up to 5 in-flights with idempotent producer
-// -
-
-// - When idempotence is enabled, the producer fills in the PID field of the batch.
-// - It seems like the producer epoch is only relevant when transactions are used.
-//   It is incremented for each successive initProducerId call for the same transaction ID.
-//   It is used to fence out old producers, if a newer producer starts that uses the same txid.
-
 func NewAsyncProducer2(addrs []string, conf *Config) (AsyncProducer, error) {
 	client, err := NewClient(addrs, conf)
 	if err != nil {
@@ -52,7 +43,6 @@ type asyncProducer2 struct {
 	awaitingLeader       map[topicPartition]*futureDeque
 	accumulator          *batchAccumulator
 	inflight             map[int32]*inflightInfo
-	drainInflight        bool
 	batchTicker          *time.Ticker
 	batchTickerRunning   bool
 	lastSuccessfulSeqNum map[topicPartition]int32
@@ -61,6 +51,15 @@ type asyncProducer2 struct {
 	mutedTopics          *mutedSet[string]
 	mutedTopicPartitions *mutedSet[topicPartition]
 	mutedBrokers         *mutedSet[int32]
+	mutedInitProducer    *mutedSet[struct{}]
+
+	// TODO: the following relate to transactions - should they be in their own struct?
+	txID            string // empty if no transaction ID set
+	idempotent      bool
+	txState         txState
+	flushTx         chan error
+	txProducerEpoch int16
+	txAbortErr      error // set if a transaction becomes abort only
 }
 
 type inflightInfo struct {
@@ -92,7 +91,6 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		awaitingLeader:       map[topicPartition]*futureDeque{},
 		accumulator:          netBatchAccumulator(config),
 		inflight:             map[int32]*inflightInfo{},
-		drainInflight:        false,
 		batchTicker:          time.NewTicker(100 * time.Millisecond), // TODO: set this from config
 		batchTickerRunning:   false,
 		lastSuccessfulSeqNum: map[topicPartition]int32{},
@@ -101,31 +99,39 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		mutedTopics:          newMutedSet[string](unMuteTimer),
 		mutedTopicPartitions: newMutedSet[topicPartition](unMuteTimer),
 		mutedBrokers:         newMutedSet[int32](unMuteTimer),
+		mutedInitProducer:    newMutedSet[struct{}](unMuteTimer),
 	}
-	p.batchTicker.Stop()
+	p.batchTicker.Stop() // annoyingly Go tickers can't be created in a stopped state
 
 	if config.Producer.Idempotent {
-		// TODO: for idempotency (and not transactions) the producer ID init call can be made
-		// to any broker (which either allocates the producer ID via ZooKeeper or the KRaft quorum).
-		// At the point transactions are supported, the init call needs to go to the coordinator that
-		// "owns" the transaction ID. So a call to FindCoordinator() (or similar) is required.
-		req := &InitProducerIDRequest{}
-		// TODO: for transactions we need more things in the request.
-		// TODO: it's also possible to send producer epochs (for resuming after something or other), need to determine when to do this...
-		resp, err := client.LeastLoadedBroker().InitProducerID(req)
-		if err != nil {
-			// TODO: need to be more resilient to this failing...
-			return nil, err
+		p.idempotent = true
+		if config.Producer.Transaction.ID != "" {
+			p.txID = config.Producer.Transaction.ID
+			p.txState = txStateUninitialized
+		} else {
+			// If idempotent, but not transacted - then initialize the producer ID
+			// at the point the async producer is created
+			req := &InitProducerIDRequest{}
+			resp, err := client.LeastLoadedBroker().InitProducerID(req)
+			if err != nil {
+				// TODO: need to be more resilient to this failing...
+				// TODO: for example try it more than once
+				return nil, err
+			}
+			if resp.Err != ErrNoError {
+				// TODO: should probably re-try if the error can be re-tried.
+				return nil, resp.Err
+			}
+			p.producerID = resp.ProducerID
+			p.producerEpoch = resp.ProducerEpoch
 		}
-		p.producerID = resp.ProducerID
-		p.producerEpoch = resp.ProducerEpoch
 	}
 
 	go p.eventLoop()
 	return p, nil
 }
 
-func (ap *asyncProducer2) AsyncClose() { // TODO: wrap in the
+func (ap *asyncProducer2) AsyncClose() {
 	//TODO: go withRecover() ??
 	go ap.Close()
 }
@@ -148,16 +154,44 @@ func (ap *asyncProducer2) Errors() <-chan *ProducerError {
 	return ap.errors
 }
 
-func (ap *asyncProducer2) IsTransactional() bool            { return false }
+// TODO: this still needs to be implemented.
+// TODO: what are the pro's and con's of also dispatching this to the goroutine
+// running the event loop?
 func (ap *asyncProducer2) TxnStatus() ProducerTxnStatusFlag { return 0 }
-func (ap *asyncProducer2) BeginTxn() error                  { return nil }
-func (ap *asyncProducer2) CommitTxn() error                 { return nil }
-func (ap *asyncProducer2) AbortTxn() error                  { return nil }
+
+func (ap *asyncProducer2) IsTransactional() bool { return ap.txID != "" }
+func (ap *asyncProducer2) BeginTxn() error       { return ap.doTxnOperation(txFlagBegin) }
+func (ap *asyncProducer2) CommitTxn() error      { return ap.doTxnOperation(txFlagCommit) }
+func (ap *asyncProducer2) AbortTxn() error       { return ap.doTxnOperation(txFlagAbort) }
+
+func (ap *asyncProducer2) doTxnOperation(flags txFlags) error {
+	if ap.txID == "" {
+		// TODO: is this the right error type to return?
+		return errors.New("producer is not transactional")
+	}
+	errCh := make(chan error)
+	defer close(errCh)
+	ap.input <- &ProducerMessage{
+		flags2:   flags,
+		txResult: errCh,
+	}
+	return <-errCh
+}
+
 func (ap *asyncProducer2) AddOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error {
 	return nil
 }
+
 func (ap *asyncProducer2) AddMessageToTxn(msg *ConsumerMessage, groupId string, metadata *string) error {
-	return nil
+	return ap.AddOffsetsToTxn(map[string][]*PartitionOffsetMetadata{
+		msg.Topic: {
+			{
+				Partition: msg.Partition,
+				Offset:    msg.Offset + 1,
+				Metadata:  metadata,
+			},
+		},
+	}, groupId)
 }
 
 func (ap *asyncProducer2) wrapIntoFuture(msg *ProducerMessage) *producerFuture {
@@ -181,6 +215,15 @@ const retryDuration = 5 * time.Second
 // TODO: currently there's no escape from this if a message persistently can't be partitioned
 func (ap *asyncProducer2) processAwaitingPartitioning() {
 	for topic, pq := range ap.awaitingPartitioning {
+		// If the transaction is aborting, then fail any queued messages
+		if ap.IsTransactional() && ap.txAbortErr != nil {
+			for !pq.isEmpty() {
+				f := pq.removeFirst()
+				f.complete(ap.txAbortErr)
+			}
+			continue
+		}
+
 		if ap.mutedTopics.contains(topic) {
 			continue // skip muted topics
 		}
@@ -213,6 +256,15 @@ func (ap *asyncProducer2) processAwaitingPartitioning() {
 // TODO: currently there's no escape from this if a message persistently can't find a leader
 func (ap *asyncProducer2) processAwaitingLeader() {
 	for tp, lq := range ap.awaitingLeader {
+		// If the transaction is aborting, then fail any queued messages
+		if ap.IsTransactional() && ap.txAbortErr != nil {
+			for !lq.isEmpty() {
+				f := lq.removeFirst()
+				f.complete(ap.txAbortErr)
+			}
+			continue
+		}
+
 		if ap.mutedTopicPartitions.contains(tp) {
 			continue
 		}
@@ -231,24 +283,44 @@ func (ap *asyncProducer2) processAwaitingLeader() {
 	}
 }
 
+// TODO: this method name isn't very good. The purpose is to determine if the producer
+// is buffering any messages that haven't yet been fully sent to the broker. The code
+// for ending a transaction is interested in determining this, as when commit / abort are
+// called, the producer needs to flush any buffered records before ending the transaction.
+func (ap *asyncProducer2) isEmpty() bool {
+	for _, pq := range ap.awaitingPartitioning {
+		if !pq.isEmpty() {
+			return false
+		}
+	}
+	for _, lq := range ap.awaitingLeader {
+		if !lq.isEmpty() {
+			return false
+		}
+	}
+	if !ap.accumulator.isEmpty() {
+		return false
+	}
+	for _, i := range ap.inflight {
+		if i != nil && !i.batches.isEmpty() {
+			return false
+		}
+	}
+	return true
+}
+
 func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
 	fmt.Printf("sending batch %p to broker %d\n", b, brokerID)
 	broker, err := ap.client.Broker(brokerID)
 	if err != nil {
 		// Handle all outcomes in the same way: another goroutine invoking asyncProducerCallback.
-		if !ap.mutedBrokers.contains(brokerID) {
-			// Guard against broker already been muted, as in the case of multiple inflight batches,
-			// it's possible for one batch to fail and mute the broker, and then a second to fail and
-			// also try to mute the broker
-			// TODO: this avoids the panic, but is it the desired behavior?
-			ap.mutedBrokers.add(brokerID, retryDuration)
-		}
 		go ap.asyncProduceCallback(brokerID, b, nil, err)
 		return
 	}
 
 	request := b.produceRequest(ap.config, ap.producerEpoch, ap.nextSequenceNum)
 	err = broker.AsyncProduce(request, func(resp *ProduceResponse, err error) {
+		// This call to asyncProducerCallback will be invoked on a thread run by the broker
 		ap.asyncProduceCallback(brokerID, b, resp, err)
 	})
 	if err != nil || request.RequiredAcks == NoResponse {
@@ -277,7 +349,10 @@ func (ap *asyncProducer2) asyncProduceCallback(brokerID int32, batch *batch, res
 		go func() {
 			fmt.Println("closing broker")
 			if !ap.mutedBrokers.contains(brokerID) {
-				// TODO: explain why this guard is necessary...
+				// Guard against broker already been muted, as in the case of multiple inflight batches,
+				// it's possible for one batch to fail and mute the broker, and then a second to fail and
+				// also try to mute the broker
+				// TODO: this avoids the panic, but is it the desired behavior?
 				ap.mutedBrokers.add(brokerID, retryDuration)
 			}
 
@@ -315,6 +390,12 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 	ap.processAwaitingPartitioning()
 	ap.processAwaitingLeader()
 
+	// If the transaction is abort-only then fail any messages held by the accumulator.
+	if ap.txAbortErr != nil {
+		ap.accumulator.failAll(ap.txAbortErr)
+		return
+	}
+
 	// TODO: tickers will panic if passed a zero duration - is that ever a valid configuration for Sarama?
 	if ap.accumulator.hasIncompleteBatches() && !ap.batchTickerRunning {
 		ap.batchTicker.Reset(100 * time.Millisecond) // TODO: get this from config
@@ -322,13 +403,6 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 	} else if !ap.accumulator.hasIncompleteBatches() && ap.batchTickerRunning {
 		ap.batchTicker.Stop()
 		ap.batchTickerRunning = false
-	}
-
-	// If the in-flight messages are being drained, then there is nothing left to do.
-	// Transitioning out of draining will occur when notified that the last of the batches has been processed
-	if ap.drainInflight {
-		fmt.Println("drainInflight")
-		return
 	}
 
 	// See if there is capacity to move accumulated batches into inflight.
@@ -403,7 +477,15 @@ func (ap *asyncProducer2) completeInFlightBatches() {
 					break
 				} else {
 					headBatch.updateLastSuccessfulSequenceNumber(ap.lastSuccessfulSeqNum)
-					headBatch.processSuccesses()
+					if ap.txAbortErr == nil {
+						headBatch.processSuccesses()
+					} else {
+						// TODO: simply this code for failing all messages in the batch.
+						headBatch.failAll(ap.txAbortErr)
+						for tp := range headBatch.futures {
+							headBatch.processFailures(tp)
+						}
+					}
 					fmt.Println("completeInFlightBatches removeFirst called")
 					brokerInFlight.batches.removeFirst()
 				}
@@ -483,7 +565,12 @@ func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *batchD
 		batch.updateLastSuccessfulSequenceNumber(ap.lastSuccessfulSeqNum)
 		batch.processSuccesses() // if any partitions completed successfully, then mark their futures as successful, and remove them from the batch
 		for tp, err := range batch.topicPartitionErrors {
-			if !isRetryable(isFirst, err) {
+			if !isRetryable(isFirst, err) || ap.txAbortErr != nil {
+				if ap.txID != "" && ap.txAbortErr == nil {
+					// Track if a non-retry-able error occurs in the scope of a transaction, as
+					// this means the transaction can only be aborted.
+					ap.txAbortErr = err
+				}
 				batch.processFailures(tp)
 			}
 		}
@@ -493,12 +580,20 @@ func (ap *asyncProducer2) completeFailedBatches(brokerID int32, inflight *batchD
 	// Iterate over the inflight batches (starting at the newest), and re-queue any non-empty batches back
 	// into the accumulator (empty batches would correspond to those that either succeeded for all topic partitions,
 	// or failed with a non-retry-able error for all topic partitions)
+	// TODO: update this comment to reflect the stuff that is happening if the transaction is aborting...
 	for idx := inflight.size() - 1; idx >= 0; idx-- {
 		batch := inflight.get(idx)
 		if len(batch.futures) > 0 {
-			batch.resetErrors()
-			batch.resolved = false // TODO: this should be done in a more general "reset" method (e.g. re-purpose batch.resetErrors())
-			ap.accumulator.requeue(brokerID, batch)
+			if ap.txAbortErr != nil {
+				batch.failAll(ap.txAbortErr)
+				for tp := range batch.futures {
+					batch.processFailures(tp)
+				}
+			} else {
+				batch.resetErrors()
+				batch.resolved = false // TODO: this should be done in a more general "reset" method (e.g. re-purpose batch.resetErrors())
+				ap.accumulator.requeue(brokerID, batch)
+			}
 		}
 	}
 }
@@ -513,6 +608,9 @@ func isRetryable(isFirstFailingInflight bool, err error) bool {
 		// Out of order sequence numbers are retry-able if a previous in-flight batch failed,
 		// as the broker only tracks sequence numbers for successfully processed batches.
 		// They are not retry-able if this error is returned for the first failing in-flight batch.
+		// TODO: is this strictly true? It seems like they can also occur if the client sends a leaderEpoch
+		// lower than the leader's epoch, which could (although it would be unlikely) occur if the leader was
+		// re-elected to the same broker (which doesn't have to be after the first batch)
 		return !isFirstFailingInflight
 	}
 	// Based on the retry-able errors documented in the Kafka Java client's ProduceResponse.java
@@ -521,6 +619,83 @@ func isRetryable(isFirstFailingInflight bool, err error) bool {
 		errors.Is(kerr, ErrNotLeaderForPartition) ||
 		errors.Is(kerr, ErrNotEnoughReplicas) ||
 		errors.Is(kerr, ErrNotEnoughReplicasAfterAppend)
+}
+
+// called by the go-routine that runs the event loop when it has been signalled to start a
+// transaction.
+func (ap *asyncProducer2) beginTransaction() error {
+	switch ap.txState {
+	case txStateUninitialized:
+		// First transaction for this producer, need to call InitProducerID() on the coordinator.
+		coordinator, err := ap.client.TransactionCoordinator(ap.txID)
+		if err != nil {
+			return err
+		}
+		req := &InitProducerIDRequest{
+			TransactionalID:    &ap.txID,
+			TransactionTimeout: ap.config.Producer.Transaction.Timeout,
+		}
+		resp, err := coordinator.InitProducerID(req)
+		if err != nil {
+			// TODO: should retry this, at least in the case the connection is broker.
+			return err
+		}
+		if resp.Err != ErrNoError {
+			// TODO: should retry this - e.g. if the coordinator has changed.
+			return resp.Err
+		}
+		// TODO: do we need to store any of the other fields from the response in asyncProducer2?
+		ap.txState = txStateInEmptyTransaction
+		ap.txProducerEpoch = resp.ProducerEpoch
+		ap.producerID = resp.ProducerID
+	case txStateInitialized:
+		// InitProducerID() already called by previous transaction.
+		ap.txState = txStateInEmptyTransaction
+	default:
+		// TODO: is this the right error type?
+		// TODO: error message could be more helpful!
+		return errors.New("wrong state to begin transaction")
+	}
+	return nil
+}
+
+// called by the go-routine that runs the event loop when it has been signalled to end a
+// transaction by committing or aborting. This process is asynchronous, as further runs of
+// the event loop may be required to flush through any buffered records. So successful
+// completion of this method leaves the transaction in either "committing" or "aborting"
+// state. When there are no buffered messages, the event loop completes the transaction
+// by sending the end transaction API flow to the broker.
+func (ap *asyncProducer2) startCompletingTransaction(commit bool, errCh chan error) {
+	switch ap.txState {
+	case txStateInEmptyTransaction:
+		panicIf(ap.txAbortErr != nil, "txAbortErr shouldn't be set if transaction is empty")
+		// Committing / aborting an empty transaction has no effect.
+		ap.txState = txStateInitialized
+
+	case txStateInTransaction:
+		if ap.txAbortErr != nil && commit {
+			// If txAbortErr is set (because a non-retry-able error occurred in the scope of
+			// the transaction) then the transaction cannot be committed. It must be aborted.
+			errCh <- ap.txAbortErr
+			return
+		}
+		panicIf(ap.flushTx != nil, "flushTx already set to a value")
+		if commit {
+			ap.txState = txStateCommittingTransaction
+		} else {
+			ap.txState = txStateAbortingTransaction
+		}
+		ap.flushTx = errCh
+
+	default:
+		// TODO: is this the right type of error?
+		// TODO: message could be more helpful.
+		if commit {
+			errCh <- errors.New("transaction not in correct state to commit")
+		} else {
+			errCh <- errors.New("transaction not in correct state to abort")
+		}
+	}
 }
 
 // eventLoop...
@@ -534,15 +709,40 @@ func (ap *asyncProducer2) eventLoop() {
 				DebugLogger.Println("closed")
 				return
 			}
-			// a new message has been passed to the async producer via its input channel
-			// create a future for it
-			f := ap.wrapIntoFuture(msg)
 
-			// Add the future to those awaiting partitioning
-			if pq, ok := ap.awaitingPartitioning[msg.Topic]; !ok {
-				ap.awaitingPartitioning[msg.Topic] = newFutureDeque(f)
-			} else {
-				pq.add(f)
+			switch msg.flags2 {
+			case txFlagBegin:
+				msg.txResult <- ap.beginTransaction()
+			case txFlagCommit:
+				ap.startCompletingTransaction(true, msg.txResult)
+			case txFlagAbort:
+				ap.startCompletingTransaction(false, msg.txResult)
+			case txFlagNotControlMessage:
+				if ap.txID != "" && !(ap.txState == txStateInEmptyTransaction || ap.txState == txStateInTransaction) {
+					ap.errors <- &ProducerError{
+						Msg: msg,
+						// TODO: error message isn't very helpful.
+						// TODO: should this error have a particular type?
+						Err: errors.New("unable to produce message as transactional producer is not in the correct state"),
+					}
+					return
+				}
+
+				// a new message has been passed to the async producer via its input channel
+				// create a future for it
+				f := ap.wrapIntoFuture(msg)
+
+				// Add the future to those awaiting partitioning
+				if pq, ok := ap.awaitingPartitioning[msg.Topic]; !ok {
+					ap.awaitingPartitioning[msg.Topic] = newFutureDeque(f)
+				} else {
+					pq.add(f)
+				}
+
+				if ap.txID != "" && ap.txState == txStateInEmptyTransaction {
+					// Accepted a message - current transaction is no longer empty.
+					ap.txState = txStateInTransaction
+				}
 			}
 
 		case <-ap.metadataRefreshed:
@@ -568,6 +768,63 @@ func (ap *asyncProducer2) eventLoop() {
 		}
 
 		ap.maybeProduceBatches()
+		ap.maybeCompleteTransaction()
+	}
+}
+
+// TODO: add support for retrying before returning an error.
+func (ap *asyncProducer2) endTxn(commit bool) error {
+	coordinator, err := ap.client.TransactionCoordinator(ap.txID)
+	if err != nil {
+		return err
+	}
+	req := &EndTxnRequest{
+		TransactionalID:   ap.txID,
+		ProducerID:        ap.producerID,
+		ProducerEpoch:     ap.txProducerEpoch,
+		TransactionResult: commit,
+	}
+	resp, err := coordinator.EndTxn(req)
+	if err != nil {
+		return err
+	}
+	if resp.Err != ErrNoError {
+		return resp.Err
+	}
+	return nil
+}
+
+func (ap *asyncProducer2) maybeCompleteTransaction() {
+	if ap.txID != "" && ap.isEmpty() && ap.flushTx != nil {
+		if ap.txState == txStateCommittingTransaction {
+			if ap.txAbortErr != nil {
+				// Encountered a non-retry-able error during the commit.
+				ap.txState = txStateInTransaction
+				ap.flushTx <- ap.txAbortErr // TODO: could wrap the "send result and set to nil" into a function.
+				ap.flushTx = nil
+				return
+			}
+			if err := ap.endTxn(true); err != nil {
+				ap.txAbortErr = err
+				ap.txState = txStateInTransaction
+				ap.flushTx <- ap.txAbortErr
+				ap.flushTx = nil
+				return
+			}
+		} else if ap.txState == txStateAbortingTransaction {
+			if err := ap.endTxn(false); err != nil {
+				if ap.txAbortErr == nil {
+					ap.txAbortErr = err
+				}
+				ap.txState = txStateInTransaction
+				ap.flushTx <- err
+				ap.flushTx = nil
+				return
+			}
+		}
+		ap.txState = txStateInitialized
+		ap.flushTx <- nil
+		ap.flushTx = nil
 	}
 }
 
@@ -672,6 +929,8 @@ func (ba *batchAccumulator) add(future *producerFuture, brokerID int32, leaderEp
 		ba.leaders[tp] = &leaderInfo{brokerID: brokerID, leaderEpoch: leaderEpoch}
 	}
 
+	// TODO: this looks suspicious... what happens if the leader has changed, surely we should
+	// strip the corresponding partitions from the partial batch too?
 	cb, ok := ba.currentBatches[brokerID]
 	if !ok { // TODO: can this pattern be abstracted into a function that uses generics?
 		cb = &partialBatch{
@@ -682,7 +941,8 @@ func (ba *batchAccumulator) add(future *producerFuture, brokerID int32, leaderEp
 
 	if !cb.add(ba.config, future) {
 		// Adding the future to the current batch would overflow
-		ba.addReadyBatch(brokerID, ba.currentBatches[brokerID].batch)
+		readyBatch := ba.currentBatches[brokerID].batch
+		ba.addReadyBatch(brokerID, leaderEpoch, readyBatch)
 		cb = &partialBatch{
 			batch: newBatch(),
 		}
@@ -691,12 +951,13 @@ func (ba *batchAccumulator) add(future *producerFuture, brokerID int32, leaderEp
 
 	if readyBatch := cb.ready(ba.config); readyBatch != nil {
 		// Batch is ready for transmission - add it to the ready batches, and reset the current batch for this broker.
-		ba.addReadyBatch(brokerID, readyBatch)
+		ba.addReadyBatch(brokerID, leaderEpoch, readyBatch)
 		delete(ba.currentBatches, brokerID)
 	}
 }
 
-func (ba *batchAccumulator) addReadyBatch(brokerID int32, b *batch) {
+func (ba *batchAccumulator) addReadyBatch(brokerID int32, leaderEpoch int32, b *batch) {
+	b.leaderEpoch = leaderEpoch
 	bdq, ok := ba.readyBatches[brokerID]
 	if !ok {
 		bdq = newBatchDeque()
@@ -722,13 +983,26 @@ func (ba *batchAccumulator) poll(brokerID int32) *batch {
 		DebugLogger.Println("batchAccumulator: poll returned nil")
 		return nil
 	}
-	return ready.removeFirst()
+	b := ready.removeFirst()
+	return b
 }
 
 func (ba *batchAccumulator) hasIncompleteBatches() bool {
 	// TODO: this is used to decide when to start/stop the ticker for time-based batch creation.
 	// If we already have available batches, does it make sense to use time-based batch creation?
 	return len(ba.currentBatches) != 0
+}
+
+func (ba *batchAccumulator) isEmpty() bool {
+	if ba.hasIncompleteBatches() {
+		return false
+	}
+	for _, ready := range ba.readyBatches {
+		if !ready.isEmpty() {
+			return false
+		}
+	}
+	return true
 }
 
 func (ba *batchAccumulator) requeue(brokerID int32, b *batch) {
@@ -738,6 +1012,33 @@ func (ba *batchAccumulator) requeue(brokerID int32, b *batch) {
 		ba.readyBatches[brokerID] = ready
 	}
 	ready.addFirst(b)
+}
+
+// failAll is used to fail all the messages held by the batch accumulator when a transaction
+// becomes abort-only.
+// TODO: re-factor the types this uses to reduce the amount of nesting / iteration that needs to take place here.
+func (ba *batchAccumulator) failAll(err error) {
+	for _, partial := range ba.currentBatches {
+		if partial.batch != nil { // TODO: is this nil check required?
+			for _, fd := range partial.batch.futures {
+				for !fd.isEmpty() {
+					f := fd.removeFirst()
+					f.complete(err)
+				}
+			}
+		}
+	}
+	for _, bd := range ba.readyBatches {
+		for !bd.isEmpty() {
+			batch := bd.removeFirst()
+			batch.failAll(err)
+			for tp := range batch.futures {
+				batch.processFailures(tp)
+			}
+		}
+	}
+	ba.currentBatches = make(map[int32]*partialBatch)
+	ba.readyBatches = make(map[int32]*batchDeque)
 }
 
 // ================================================================================
@@ -932,6 +1233,7 @@ type batch struct {
 	hasFailures          bool
 	resolved             bool // TODO: not a good name - when this is set to true it means that we've determined the outcome of sending this batch.
 	firstSequenceNum     map[topicPartition]int32
+	leaderEpoch          int32
 }
 
 func newBatch() *batch {
@@ -1063,7 +1365,7 @@ func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map
 		}
 		rb := &RecordBatch{
 			Version:              2,
-			PartitionLeaderEpoch: 0, // TODO: this is never used by Sarama (but the broker expects it)...
+			PartitionLeaderEpoch: b.leaderEpoch, // TODO: this is never set by Sarama...
 			ProducerEpoch:        producerEpoch,
 			Codec:                config.Producer.Compression,
 			CompressionLevel:     config.Producer.CompressionLevel,
@@ -1260,6 +1562,48 @@ func (ms *mutedSet[T]) add(v T, d time.Duration) {
 	ms.muted[v] = time.Now().Add(d)
 	ms.timer.notifyIn(d, 0)
 }
+
+// ================================================================================
+type txState string
+
+const (
+	// initial state for transactional producer, InitProducerID() has not been
+	// called yet.
+	txStateUninitialized = "uninitialized"
+
+	// InitProducerID() has successfully being called.
+	txStateInitialized = "initialized"
+
+	// producer is in a state where it can accept messages / offsets into a transaction.
+	// Currently no messages / offsets have been associated with the transaction.
+	// TODO: should this be modeled as a separate state - or as a flag that we set?
+	// TODO: wait until more code has been written, and hope it becomes clearer.
+	txStateInEmptyTransaction = "inEmptyTransaction"
+
+	// producer is in a state where it can accept messages / offsets into a transaction.
+	// Currently there is at least one message or offset associated with the transaction.
+	txStateInTransaction = "inTransaction"
+
+	// commit has been called, and the transaction is in the process of being committed.
+	// This state is required because committing the transaction occurs asynchronously
+	// within the eventLoop (e.g. any in-flight messages will be flushed), so it is
+	// possible for another go-routine to try and trigger a transaction state transition
+	// while this is in-progress.
+	txStateCommittingTransaction = "committingTransaction"
+
+	// similar to 'txStateCommittingTransaction', but used to track that the process of
+	// aborting the transaction has started.
+	txStateAbortingTransaction = "abortingTransaction"
+)
+
+// ================================================================================
+type txFlags string // txFlags used in ProducerMessage in async_producer.go
+const (
+	txFlagNotControlMessage = "" // Needs to be zero value for txFlags underlying type
+	txFlagBegin             = "begin"
+	txFlagCommit            = "commit"
+	txFlagAbort             = "abort"
+)
 
 // ================================================================================
 
