@@ -254,7 +254,7 @@ func (b *Broker) Open(conf *Config) error {
 		}
 
 		b.done = make(chan bool)
-		b.responses = make(chan *responsePromise, b.conf.Net.MaxOpenRequests-1)
+		b.responses = make(chan *responsePromise, b.conf.Net.MaxOpenRequests /*-1*/) // TODO: AJP - required to stop asyncproducer2 from deadlocking. Need to think about this.
 
 		go withRecover(b.responseReceiver)
 		if conf.Net.SASL.Enable && !useSaslV0 {

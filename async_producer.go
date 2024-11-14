@@ -199,8 +199,10 @@ type ProducerMessage struct {
 	hasSequence    bool
 
 	// TODO: the following are used by async_producer2.go
-	flags2   txFlags
-	txResult chan error
+	flags2              txFlags
+	txResult            chan error
+	txAddOffsets        map[string][]*PartitionOffsetMetadata
+	txAddOffsetsGroupId string
 }
 
 const producerMessageOverhead = 26 // the metadata overhead of CRC, flags, etc.

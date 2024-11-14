@@ -51,7 +51,6 @@ type asyncProducer2 struct {
 	mutedTopics          *mutedSet[string]
 	mutedTopicPartitions *mutedSet[topicPartition]
 	mutedBrokers         *mutedSet[int32]
-	mutedInitProducer    *mutedSet[struct{}]
 
 	// TODO: the following relate to transactions - should they be in their own struct?
 	txID            string // empty if no transaction ID set
@@ -99,7 +98,6 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		mutedTopics:          newMutedSet[string](unMuteTimer),
 		mutedTopicPartitions: newMutedSet[topicPartition](unMuteTimer),
 		mutedBrokers:         newMutedSet[int32](unMuteTimer),
-		mutedInitProducer:    newMutedSet[struct{}](unMuteTimer),
 	}
 	p.batchTicker.Stop() // annoyingly Go tickers can't be created in a stopped state
 
@@ -179,7 +177,20 @@ func (ap *asyncProducer2) doTxnOperation(flags txFlags) error {
 }
 
 func (ap *asyncProducer2) AddOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error {
-	return nil
+	// TODO: this is a copy of doTxnOperation, can it be made more common?
+	if ap.txID == "" {
+		// TODO: is this the right error type to return?
+		return errors.New("producer is not transactional")
+	}
+	errCh := make(chan error)
+	defer close(errCh)
+	ap.input <- &ProducerMessage{
+		flags2:              txFlagAddOffsets,
+		txAddOffsets:        offsets,
+		txAddOffsetsGroupId: groupId,
+		txResult:            errCh,
+	}
+	return <-errCh
 }
 
 func (ap *asyncProducer2) AddMessageToTxn(msg *ConsumerMessage, groupId string, metadata *string) error {
@@ -698,6 +709,11 @@ func (ap *asyncProducer2) startCompletingTransaction(commit bool, errCh chan err
 	}
 }
 
+func (ap *asyncProducer2) addOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error {
+	// TODO: implement!
+	return nil
+}
+
 // eventLoop...
 func (ap *asyncProducer2) eventLoop() {
 	for {
@@ -717,6 +733,8 @@ func (ap *asyncProducer2) eventLoop() {
 				ap.startCompletingTransaction(true, msg.txResult)
 			case txFlagAbort:
 				ap.startCompletingTransaction(false, msg.txResult)
+			case txFlagAddOffsets:
+				msg.txResult <- ap.addOffsetsToTxn(msg.txAddOffsets, msg.txAddOffsetsGroupId)
 			case txFlagNotControlMessage:
 				if ap.txID != "" && !(ap.txState == txStateInEmptyTransaction || ap.txState == txStateInTransaction) {
 					ap.errors <- &ProducerError{
@@ -1603,6 +1621,7 @@ const (
 	txFlagBegin             = "begin"
 	txFlagCommit            = "commit"
 	txFlagAbort             = "abort"
+	txFlagAddOffsets        = "addOffsets"
 )
 
 // ================================================================================
