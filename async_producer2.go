@@ -709,9 +709,84 @@ func (ap *asyncProducer2) startCompletingTransaction(commit bool, errCh chan err
 	}
 }
 
+// addOffsetToTxn is called by the eventLoop go-routine in response to a request to add
+// offsets to a transaction.
+// TODO: Each call performs two request/response exchanges with the broker is inefficient,
+// as (unlike committing or aborting the transaction) it would be possible for the client
+// to continue to send messages or add more offsets while these requests are in-flight.
+// However, to implement this, Broker would need to have a way to send the add offset
+// and offset commit requests and be notified of the responses later (much like the
+// existing Broker.AsyncProduce(...) method already provides for sending messages).
 func (ap *asyncProducer2) addOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error {
-	// TODO: implement!
+	switch ap.txState {
+	case txStateInEmptyTransaction:
+		panicIf(ap.txAbortErr != nil, "shouldn't have txAbortErr set if transaction is empty")
+		ap.txState = txStateInTransaction
+	case txStateInTransaction:
+		if ap.txAbortErr != nil {
+			return ap.txAbortErr
+		}
+		// Otherwise drop of out of this switch statement and try to add the offset
+	default:
+		return errors.New("transaction not in correct state to add offsets")
+	}
+
+	txCoordinator, err := ap.client.TransactionCoordinator(ap.txID)
+	if err != nil {
+		// TODO: retry on this.
+		ap.txAbortErr = err
+		return err
+	}
+	req := &AddOffsetsToTxnRequest{
+		TransactionalID: ap.txID,
+		ProducerID:      ap.producerID,
+		ProducerEpoch:   ap.producerEpoch,
+		GroupID:         groupId,
+	}
+	resp, err := txCoordinator.AddOffsetsToTxn(req)
+	if err != nil {
+		// TODO: should retry this, at least in the case the connection is broker.
+		ap.txAbortErr = err
+		return err
+	}
+	if resp.Err != ErrNoError {
+		// TODO: should retry this, as coordinator could have changed.
+		ap.txAbortErr = resp.Err
+		return resp.Err
+	}
+
+	groupCoordinator, err := ap.client.Coordinator(groupId)
+	if err != nil {
+		// TODO: retry on this
+		ap.txAbortErr = err
+		return err
+	}
+	commitReq := &TxnOffsetCommitRequest{
+		Version:         2, // TODO: set this based on configured version...
+		TransactionalID: ap.txID,
+		ProducerEpoch:   ap.producerEpoch,
+		ProducerID:      ap.producerID,
+		GroupID:         groupId,
+		Topics:          offsets,
+	}
+	commitResp, err := groupCoordinator.TxnOffsetCommit(commitReq)
+	if err != nil {
+		// TODO: add some retry logic
+		ap.txAbortErr = err
+		return err
+	}
+	// TODO: can commitResp be nil? The existing transaction manager code checks for this...
+
+	for _, pes := range commitResp.Topics {
+		for _, pe := range pes {
+			if pe.Err != ErrNoError {
+				ap.txAbortErr = pe.Err
+				return pe.Err
+			}
+		}
+	}
 	return nil
+
 }
 
 // eventLoop...
@@ -743,7 +818,14 @@ func (ap *asyncProducer2) eventLoop() {
 						// TODO: should this error have a particular type?
 						Err: errors.New("unable to produce message as transactional producer is not in the correct state"),
 					}
-					return
+					break
+				}
+				if ap.txAbortErr != nil {
+					ap.errors <- &ProducerError{
+						Msg: msg,
+						Err: ap.txAbortErr,
+					}
+					break
 				}
 
 				// a new message has been passed to the async producer via its input channel
