@@ -53,12 +53,14 @@ type asyncProducer2 struct {
 	mutedBrokers         *mutedSet[int32]
 
 	// TODO: the following relate to transactions - should they be in their own struct?
-	txID            string // empty if no transaction ID set
-	idempotent      bool
-	txState         txState
-	flushTx         chan error
-	txProducerEpoch int16
-	txAbortErr      error // set if a transaction becomes abort only
+	txID              string // empty if no transaction ID set
+	idempotent        bool
+	txState           txState
+	flushTx           chan error
+	txProducerEpoch   int16                       // TODO: how does this differ from the produceEpoch field?
+	txAbortErr        error                       // set if a transaction becomes abort only
+	txAddedPartitions map[topicPartition]struct{} // set of partitions already added to current tx
+	txNewPartitions   map[topicPartition]struct{} // set of partitions not yet added to current tx
 }
 
 type inflightInfo struct {
@@ -98,6 +100,8 @@ func newAsyncProducer2(client Client) (AsyncProducer, error) {
 		mutedTopics:          newMutedSet[string](unMuteTimer),
 		mutedTopicPartitions: newMutedSet[topicPartition](unMuteTimer),
 		mutedBrokers:         newMutedSet[int32](unMuteTimer),
+		txAddedPartitions:    map[topicPartition]struct{}{},
+		txNewPartitions:      map[topicPartition]struct{}{},
 	}
 	p.batchTicker.Stop() // annoyingly Go tickers can't be created in a stopped state
 
@@ -223,6 +227,15 @@ func (ap *asyncProducer2) wrapIntoFuture(msg *ProducerMessage) *producerFuture {
 // TODO: this is a place-holder until a proper retry time calculation is implemented.
 const retryDuration = 5 * time.Second
 
+// associatePartitionWithTransaction records that the specified partition is part of the current
+// transaction. This is used to ensure that a 'AddPartitionsToTxnRequest' is sent to the transaction
+// coordinator prior to producing the first record to the partition.
+func (ap *asyncProducer2) associatePartitionWithTransaction(tp *topicPartition) {
+	if _, ok := ap.txAddedPartitions[*tp]; !ok { // Skip if an AddPartitionToTxnRequest has already been sent
+		ap.txNewPartitions[*tp] = struct{}{}
+	}
+}
+
 // TODO: currently there's no escape from this if a message persistently can't be partitioned
 func (ap *asyncProducer2) processAwaitingPartitioning() {
 	for topic, pq := range ap.awaitingPartitioning {
@@ -255,6 +268,9 @@ func (ap *asyncProducer2) processAwaitingPartitioning() {
 			}
 
 			tp := topicPartition{f.msg.Topic, f.msg.Partition}
+			if ap.config.Producer.Transaction.ID != "" {
+				ap.associatePartitionWithTransaction(&tp)
+			}
 			if lq, ok := ap.awaitingLeader[tp]; !ok {
 				ap.awaitingLeader[tp] = newFutureDeque(f)
 			} else {
@@ -329,7 +345,7 @@ func (ap *asyncProducer2) sendToBroker(brokerID int32, b *batch) {
 		return
 	}
 
-	request := b.produceRequest(ap.config, ap.producerEpoch, ap.nextSequenceNum)
+	request := b.produceRequest(ap.config, ap.producerID, ap.producerEpoch, ap.nextSequenceNum)
 	err = broker.AsyncProduce(request, func(resp *ProduceResponse, err error) {
 		// This call to asyncProducerCallback will be invoked on a thread run by the broker
 		ap.asyncProduceCallback(brokerID, b, resp, err)
@@ -396,15 +412,70 @@ type asyncProduceResult struct {
 	err      error
 }
 
+func (ap *asyncProducer2) addNewPartitionsToTransaction() error {
+	if len(ap.txNewPartitions) == 0 {
+		// No new partitions to add - return early.
+		return nil
+	}
+
+	coordinator, err := ap.client.TransactionCoordinator(ap.txID)
+	if err != nil {
+		return err
+	}
+	tps := map[string][]int32{}
+	for tp := range ap.txNewPartitions {
+		tps[tp.topic] = append(tps[tp.topic], tp.partition)
+		ap.txAddedPartitions[tp] = struct{}{}
+	}
+	// TODO: probably don't want to reset this here
+	// TODO: in the future if some partitions are retry-able, need to remove the successful
+	// partitions from this map.
+	ap.txNewPartitions = map[topicPartition]struct{}{}
+	req := &AddPartitionsToTxnRequest{
+		TransactionalID: ap.txID, // TODO: I've been mixing and matching ap.txID, and ap.config.Producer.Transaction.ID... pick one!
+		ProducerID:      ap.producerID,
+		ProducerEpoch:   ap.producerEpoch,
+		TopicPartitions: tps,
+		// TODO: should set version!
+	}
+	fmt.Printf("adding partitions to transaction: %v\n", tps)
+	resp, err := coordinator.AddPartitionsToTxn(req)
+	if err != nil {
+		// TODO: should retry this, at least in the case the connection is broker.
+		return err
+	}
+	fmt.Printf("response: %+v\n", resp)
+	for _, pes := range resp.Errors {
+		// TODO: the existing Sarama implementation (in transaction_manager.go) has considerably more error handling than this...
+		for _, pe := range pes {
+			if pe != nil && pe.Err != ErrNoError {
+				return pe.Err
+			}
+		}
+	}
+	return nil
+}
+
 func (ap *asyncProducer2) maybeProduceBatches() {
 	// Try to assign partitions to any futures awaiting partitioning, and find leaders for any awaiting a leader
 	ap.processAwaitingPartitioning()
 	ap.processAwaitingLeader()
 
-	// If the transaction is abort-only then fail any messages held by the accumulator.
-	if ap.txAbortErr != nil {
-		ap.accumulator.failAll(ap.txAbortErr)
-		return
+	if ap.config.Producer.Transaction.ID != "" {
+		// If the transaction is abort-only then fail any messages held by the accumulator.
+		if ap.txAbortErr != nil {
+			ap.accumulator.failAll(ap.txAbortErr)
+			return
+		}
+
+		// If new topic/partitions have been used with the current transaction, then send a
+		// AddPartitionsToTxnRequest to the transaction coordinator.
+		if err := ap.addNewPartitionsToTransaction(); err != nil {
+			ap.txAbortErr = err
+			fmt.Printf("ABORTING ALL WITH: %v\n", err.Error())
+			ap.accumulator.failAll(ap.txAbortErr)
+			return
+		}
 	}
 
 	// TODO: tickers will panic if passed a zero duration - is that ever a valid configuration for Sarama?
@@ -821,6 +892,15 @@ func (ap *asyncProducer2) eventLoop() {
 					break
 				}
 				if ap.txAbortErr != nil {
+					// TODO: combine into above if statement.
+					ap.errors <- &ProducerError{
+						Msg: msg,
+						Err: ap.txAbortErr,
+					}
+				}
+				// x
+				// If the transaction abort error is set - then toss the message at this point...
+				if ap.txAbortErr != nil {
 					ap.errors <- &ProducerError{
 						Msg: msg,
 						Err: ap.txAbortErr,
@@ -925,6 +1005,14 @@ func (ap *asyncProducer2) maybeCompleteTransaction() {
 		ap.txState = txStateInitialized
 		ap.flushTx <- nil
 		ap.flushTx = nil
+		ap.txNewPartitions = map[topicPartition]struct{}{} // TODO: some of this stuff should live in a "resetTxState" method.
+		ap.txAddedPartitions = map[topicPartition]struct{}{}
+		// TODO:
+		ap.txAbortErr = nil
+		//x
+		// TODO: if the transactional producer hits an un-recoverable error then the easiest way to
+		// handle this would be to leave txAbortErr set to the error value - and maybe transition to
+		// a new state (so we don't allow a further call to abort() to reset it).
 	}
 }
 
@@ -1432,12 +1520,15 @@ func (b *batch) isEmpty() bool {
 	return len(b.futures) == 0
 }
 
-func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map[topicPartition]int32) *ProduceRequest {
+func (b *batch) produceRequest(config *Config, producerID int64, producerEpoch int16, sequence map[topicPartition]int32) *ProduceRequest {
 	// TODO: for the moment, we only care about building the version 2 batch format.
 	pr := &ProduceRequest{
 		RequiredAcks: config.Producer.RequiredAcks,
 		Timeout:      int32(config.Producer.Timeout / time.Millisecond),
 		records:      map[string]map[int32]Records{},
+	}
+	if config.Producer.Transaction.ID != "" {
+		pr.TransactionalID = &config.Producer.Transaction.ID
 	}
 	switch {
 	case config.Version.IsAtLeast(V2_1_0_0):
@@ -1466,6 +1557,7 @@ func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map
 		rb := &RecordBatch{
 			Version:              2,
 			PartitionLeaderEpoch: b.leaderEpoch, // TODO: this is never set by Sarama...
+			ProducerID:           producerID,
 			ProducerEpoch:        producerEpoch,
 			Codec:                config.Producer.Compression,
 			CompressionLevel:     config.Producer.CompressionLevel,
@@ -1473,6 +1565,7 @@ func (b *batch) produceRequest(config *Config, producerEpoch int16, sequence map
 			Records: recordSlice,
 			// FirstOffset - apparently this always needs to be zero??
 			// FirstSequence - set below.
+			IsTransactional: config.Producer.Transaction.ID != "",
 		}
 		if config.Producer.Idempotent {
 			rb.FirstSequence = sequence[tp]
