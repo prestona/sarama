@@ -68,6 +68,17 @@ type inflightInfo struct {
 	batches *batchDeque
 }
 
+func (ap *asyncProducer2) abortableError(err error) {
+	if ap.txAbortErr != nil {
+		ap.txAbortErr = err
+	}
+}
+
+func (ap *asyncProducer2) fatalError(err error) {
+	ap.abortableError(err)
+	// TODO: need to mark the async producer as having received a fatal error.
+}
+
 func newAsyncProducer2(client Client) (AsyncProducer, error) {
 	if client.Closed() {
 		return nil, ErrClosedClient
@@ -268,7 +279,7 @@ func (ap *asyncProducer2) processAwaitingPartitioning() {
 			}
 
 			tp := topicPartition{f.msg.Topic, f.msg.Partition}
-			if ap.config.Producer.Transaction.ID != "" {
+			if ap.txID != "" {
 				ap.associatePartitionWithTransaction(&tp)
 			}
 			if lq, ok := ap.awaitingLeader[tp]; !ok {
@@ -413,47 +424,142 @@ type asyncProduceResult struct {
 }
 
 func (ap *asyncProducer2) addNewPartitionsToTransaction() error {
-	if len(ap.txNewPartitions) == 0 {
-		// No new partitions to add - return early.
-		return nil
-	}
+	return retry(retryConfig{
+		maxRetries:     ap.config.Producer.Transaction.Retry.Max,
+		backoffFunc:    ap.config.Producer.Transaction.Retry.BackoffFunc,
+		defaultBackoff: ap.config.Producer.Transaction.Retry.Backoff,
+	}, func() error {
+		if len(ap.txNewPartitions) == 0 {
+			return nil // No new partitions to add - success!
+		}
 
-	coordinator, err := ap.client.TransactionCoordinator(ap.txID)
-	if err != nil {
-		return err
-	}
-	tps := map[string][]int32{}
-	for tp := range ap.txNewPartitions {
-		tps[tp.topic] = append(tps[tp.topic], tp.partition)
-		ap.txAddedPartitions[tp] = struct{}{}
-	}
-	// TODO: probably don't want to reset this here
-	// TODO: in the future if some partitions are retry-able, need to remove the successful
-	// partitions from this map.
-	ap.txNewPartitions = map[topicPartition]struct{}{}
-	req := &AddPartitionsToTxnRequest{
-		TransactionalID: ap.txID, // TODO: I've been mixing and matching ap.txID, and ap.config.Producer.Transaction.ID... pick one!
-		ProducerID:      ap.producerID,
-		ProducerEpoch:   ap.producerEpoch,
-		TopicPartitions: tps,
-		// TODO: should set version!
-	}
-	fmt.Printf("adding partitions to transaction: %v\n", tps)
-	resp, err := coordinator.AddPartitionsToTxn(req)
-	if err != nil {
-		// TODO: should retry this, at least in the case the connection is broker.
-		return err
-	}
-	fmt.Printf("response: %+v\n", resp)
-	for _, pes := range resp.Errors {
-		// TODO: the existing Sarama implementation (in transaction_manager.go) has considerably more error handling than this...
-		for _, pe := range pes {
-			if pe != nil && pe.Err != ErrNoError {
-				return pe.Err
+		coordinator, err := ap.client.TransactionCoordinator(ap.txID)
+		if err != nil {
+			return retryError(err)
+		}
+
+		tps := map[string][]int32{}
+		for tp := range ap.txNewPartitions {
+			tps[tp.topic] = append(tps[tp.topic], tp.partition)
+		}
+		req := &AddPartitionsToTxnRequest{
+			TransactionalID: ap.txID,
+			ProducerID:      ap.producerID,
+			ProducerEpoch:   ap.producerEpoch,
+			TopicPartitions: tps,
+		}
+		if ap.config.Version.IsAtLeast(V2_7_0_0) {
+			// Version 2 adds the support for new error code PRODUCER_FENCED.
+			req.Version = 2
+		} else if ap.config.Version.IsAtLeast(V2_0_0_0) {
+			// Version 1 is the same as version 0.
+			req.Version = 1
+		}
+
+		resp, err := coordinator.AddPartitionsToTxn(req)
+		if err != nil {
+			// Likely a network interruption. Try to re-establish connectivity to the coordinator.
+			_ = coordinator.Close()
+			_ = ap.client.RefreshTransactionCoordinator(ap.txID)
+			return retryError(err)
+		}
+
+		var retry error
+
+		// Response can contain different errors for different partitions. For each partition, decide if:
+		// 1. The operation succeeded. The partition can be removed from the set of partitions to add,
+		//    and added to the set of partitions in the transaction. No retry of the add API is required.
+		// 2. The operation failed but should be retried. These partitions are left in the set of partitions
+		//    to be added and the add API is retried.
+		// 3. The operation failed and the transaction should be aborted. All the pending partitions to be
+		//    added are discarded, and the transaction is marked as abort-only. No retry of the add API is
+		//    attempted.
+		for topicName, partitionErrors := range resp.Errors {
+			for _, pe := range partitionErrors {
+				switch {
+				case pe.Err == ErrNoError: // Success
+					tp := topicPartition{topicName, pe.Partition}
+					delete(ap.txNewPartitions, tp)
+					ap.txAddedPartitions[tp] = struct{}{}
+				case pe.Err == ErrConsumerCoordinatorNotAvailable || pe.Err == ErrNotCoordinatorForConsumer:
+					// Refresh the coordinator and try again.
+					_ = coordinator.Close()
+					_ = ap.client.RefreshTransactionCoordinator(ap.txID)
+					retry = retryError(pe.Err)
+				case pe.Err == ErrConcurrentTransactions:
+					// See:  https://issues.apache.org/jira/browse/KAFKA-5482
+					retry = retryError(pe.Err)
+					if len(ap.txAddedPartitions) == 0 {
+						retry = retryError(pe.Err).withBackoff(time.Millisecond * 20)
+					}
+				case isRetryableError(pe.Err):
+					retry = retryError(pe.Err)
+				case pe.Err == ErrInvalidProducerEpoch || pe.Err == ErrProducerFenced:
+					ap.fatalError(ErrProducerFenced)
+					ap.txNewPartitions = map[topicPartition]struct{}{}
+				case pe.Err == ErrTransactionalIDAuthorizationFailed ||
+					pe.Err == ErrInvalidTxnState || pe.Err == ErrInvalidProducerIDMapping:
+					ap.fatalError(ErrProducerFenced)
+					ap.txNewPartitions = map[topicPartition]struct{}{}
+				case pe.Err == ErrTopicAuthorizationFailed || pe.Err == ErrOperationNotAttempted:
+					ap.abortableError(pe.Err)
+					ap.txNewPartitions = map[topicPartition]struct{}{}
+				case pe.Err == ErrUnknownProducerID:
+					// TODO: the Java code has can optionally treat this as a non-fatal
+					// error, depending on the protocol version being used. We're going
+					// to start off by assuming it's always fatal.
+					ap.fatalError(pe.Err)
+				default:
+					// TODO: is there a better error code if we get here?
+					ap.abortableError(errors.New("unexpected error"))
+				}
 			}
 		}
+
+		// TODO: this assumes that txAbortErr is still set if the error was a
+		// fatal error - need to firm up a decision on this.
+		if ap.txAbortErr != nil {
+			return ap.txAbortErr
+		} else if retry != nil {
+			return retry
+		}
+		return nil
+	})
+}
+
+// isRetryableError returns true if the error is listed as retry-able in the
+// Kafka protocol documentation.
+func isRetryableError(err KError) bool {
+	switch err {
+	case ErrInvalidMessage,
+		ErrUnknownTopicOrPartition,
+		ErrLeaderNotAvailable,
+		ErrNotLeaderForPartition,
+		ErrRequestTimedOut,
+		ErrReplicaNotAvailable,
+		ErrNetworkException,
+		ErrOffsetsLoadInProgress,
+		ErrNotCoordinatorForConsumer,
+		ErrNotEnoughReplicas,
+		ErrNotEnoughReplicasAfterAppend,
+		ErrNotController,
+		ErrConcurrentTransactions,
+		ErrKafkaStorageError,
+		ErrFetchSessionIDNotFound,
+		ErrInvalidFetchSessionEpoch,
+		ErrListenerNotFound,
+		ErrFencedLeaderEpoch,
+		ErrUnknownLeaderEpoch,
+		ErrOffsetNotAvailable,
+		ErrPreferredLeaderNotAvailable,
+		ErrEligibleLeadersNotAvailable,
+		ErrElectionNotNeeded,
+		ErrUnstableOffsetCommit,
+		ErrThrottlingQuotaExceeded:
+		return true
+	default:
+		return false
 	}
-	return nil
 }
 
 func (ap *asyncProducer2) maybeProduceBatches() {
@@ -461,7 +567,7 @@ func (ap *asyncProducer2) maybeProduceBatches() {
 	ap.processAwaitingPartitioning()
 	ap.processAwaitingLeader()
 
-	if ap.config.Producer.Transaction.ID != "" {
+	if ap.txID != "" {
 		// If the transaction is abort-only then fail any messages held by the accumulator.
 		if ap.txAbortErr != nil {
 			ap.accumulator.failAll(ap.txAbortErr)
@@ -1527,6 +1633,7 @@ func (b *batch) produceRequest(config *Config, producerID int64, producerEpoch i
 		Timeout:      int32(config.Producer.Timeout / time.Millisecond),
 		records:      map[string]map[int32]Records{},
 	}
+	// TODO: mixing and matching config.Producer.Transaction.ID and ap.txID
 	if config.Producer.Transaction.ID != "" {
 		pr.TransactionalID = &config.Producer.Transaction.ID
 	}
@@ -1804,5 +1911,77 @@ const (
 func panicIf(b bool, msg string, v ...any) {
 	if b {
 		panic(fmt.Sprintf(msg, v...))
+	}
+}
+
+// ================================================================================
+
+type retryConfig struct {
+	maxRetries     int
+	backoffFunc    func(retries, maxRetries int) time.Duration
+	defaultBackoff time.Duration
+}
+
+type retryableError struct {
+	error
+	backoff *time.Duration
+}
+
+func (re retryableError) Error() string {
+	return re.error.Error()
+}
+
+func (re retryableError) Unwrap() error {
+	return re.error
+}
+
+func (re retryableError) Is(err error) bool {
+	_, ok := err.(retryableError)
+	return ok
+}
+
+func (re retryableError) withBackoff(d time.Duration) retryableError {
+	return retryableError{
+		error:   re.error,
+		backoff: &d,
+	}
+}
+
+// retryError wraps an error into a retryableError
+func retryError(err error) retryableError {
+	return retryableError{
+		error: err,
+	}
+}
+
+// retry 'fn' based on the specified configuration.
+//   - if `fn` returns nil then no (more) retries are attempted and nil is returned.
+//   - if `fn` returns a retryableError then `fn` will be called again until the configured
+//     retry limit is reached. If the retry limit is reached then the retryableError value
+//     returned by `fn` will be unwrapped and the contained error will be returned.
+//   - if `fn` returns an error that isn't wrapped into a retryableError then `fn` will
+//     not be called again, and the error will be returned.
+func retry(cfg retryConfig, fn func() error) error {
+	retries := 0
+	for {
+		var re retryableError
+		err := fn()
+		if err == nil { // success
+			return nil
+		} else if errors.As(err, &re) { // retry
+			retries++
+			if retries > cfg.maxRetries {
+				return re.error
+			}
+			if re.backoff != nil {
+				time.Sleep(*re.backoff)
+			} else if cfg.backoffFunc != nil {
+				time.Sleep(cfg.backoffFunc(retries, cfg.maxRetries))
+			} else {
+				time.Sleep(cfg.defaultBackoff)
+			}
+		} else { // fail
+			return err
+		}
 	}
 }
