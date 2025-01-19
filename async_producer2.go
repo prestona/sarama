@@ -57,7 +57,6 @@ type asyncProducer2 struct {
 	idempotent        bool
 	txState           txState
 	flushTx           chan error
-	txProducerEpoch   int16                       // TODO: how does this differ from the produceEpoch field?
 	txAbortErr        error                       // set if a transaction becomes abort only
 	txAddedPartitions map[topicPartition]struct{} // set of partitions already added to current tx
 	txNewPartitions   map[topicPartition]struct{} // set of partitions not yet added to current tx
@@ -834,7 +833,7 @@ func (ap *asyncProducer2) beginTransaction() error {
 		}
 		// TODO: do we need to store any of the other fields from the response in asyncProducer2?
 		ap.txState = txStateInEmptyTransaction
-		ap.txProducerEpoch = resp.ProducerEpoch
+		ap.producerEpoch = resp.ProducerEpoch
 		ap.producerID = resp.ProducerID
 	case txStateInitialized:
 		// InitProducerID() already called by previous transaction.
@@ -1067,7 +1066,7 @@ func (ap *asyncProducer2) endTxn(commit bool) error {
 	req := &EndTxnRequest{
 		TransactionalID:   ap.txID,
 		ProducerID:        ap.producerID,
-		ProducerEpoch:     ap.txProducerEpoch,
+		ProducerEpoch:     ap.producerEpoch,
 		TransactionResult: commit,
 	}
 	resp, err := coordinator.EndTxn(req)
